@@ -13,8 +13,9 @@ namespace SrankFlag;
 // v1.1.71 试点 / v1.1.72 扩展：把「触发中」与「自动前往」两个窗口换成游戏原生窗口。
 // KTK 相关类型集中在 NativeHud.cs + NativeAutoWindow.cs。
 // v1.2.5：自动前往 / 触发中两个窗口的 ImGui 兜底版已彻底删除（DrawAutoWindow / DrawAutoHud 不再存在），
-// 只保留原生 KTK 窗口；若 KTK 初始化或运行失败，该窗口直接不显示，绝不再回退 ImGui 避免串台。
-// 主窗口（MagicBucket）仍保留 ImGui 兜底：KTK 主窗不可用时降级回 ImGui 主窗，由 ActiveMain 控制。
+// 只保留原生 KTK 窗口；若 KTK 初始化或运行失败，该窗口直接不显示，绝不再回退（无 ImGui 兜底） 避免串台。
+// 主窗口（MagicBucket）不再保留 ImGui 兜底：KTK 主窗不可用时直接不显示（无 ImGui 回退），由 ActiveMain 控制；
+// 若 KTK 初始化 / 运行失败，主窗将不出现，请检查插件目录的 KamiToolKit.dll / FFXIVClientStructs.Expansion.dll。
 // KamiToolKitLibrary 是全局静态，只能初始化 / 释放一次，所以窗口共用本 Runtime。
 // 运行期依赖：插件目录需有 KamiToolKit.dll + FFXIVClientStructs.Expansion.dll。
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +94,7 @@ internal sealed class NativeHudRuntime
     internal bool ActiveMain => Enabled && EnabledMain && !this.failed && !this.mainFailed &&
                                 !this.disposed && this.mainWindow is not null;
 
-    /// <summary>KTK 初始化是否已经成功完成；失败时整体回退 ImGui。</summary>
+    /// <summary>KTK 初始化是否已经成功完成；失败时整体回退（无 ImGui 兜底）。</summary>
     private bool InitReady()
     {
         var t = this.initTask;
@@ -101,7 +102,7 @@ internal sealed class NativeHudRuntime
         if (t.IsFaulted)
         {
             this.failed = true;
-            this.log($"[原生UI] 初始化异常，全部回退 ImGui：{t.Exception}");
+            this.log($"[原生UI] 初始化异常，全部回退（无 ImGui 兜底）：{t.Exception}");
             return false;
         }
         return true;
@@ -119,7 +120,7 @@ internal sealed class NativeHudRuntime
         catch (Exception ex)
         {
             this.failed = true;
-            this.log($"[原生HUD] KTK 初始化失败，回退 ImGui：{ex.Message}");
+            this.log($"[原生HUD] KTK 初始化失败，回退（无 ImGui 兜底）：{ex.Message}");
         }
     }
 
@@ -154,7 +155,7 @@ internal sealed class NativeHudRuntime
         catch (Exception ex)
         {
             this.failed = true;
-            this.log($"[原生HUD] 运行异常，已停用并回退 ImGui：{ex}");
+            this.log($"[原生HUD] 运行异常，已停用并回退（无 ImGui 兜底）：{ex}");
         }
     }
 
@@ -186,7 +187,7 @@ internal sealed class NativeHudRuntime
         catch (Exception ex)
         {
             this.autoFailed = true;
-            this.log($"[原生UI] 自动前往窗口异常，已停用并回退 ImGui：{ex}");
+            this.log($"[原生UI] 自动前往窗口异常，已停用并回退（无 ImGui 兜底）：{ex}");
             try { this.autoWindow?.Close(); } catch { /* 忽略清理异常 */ }
         }
     }
@@ -224,7 +225,7 @@ internal sealed class NativeHudRuntime
         catch (Exception ex)
         {
             this.mainFailed = true;
-            this.log($"[原生UI] 主窗口异常，已停用并回退 ImGui：{ex}");
+            this.log($"[原生UI] 主窗口异常，已停用并回退（无 ImGui 兜底）：{ex}");
             try { this.mainWindow?.Close(); } catch { /* 忽略清理异常 */ }
         }
     }
