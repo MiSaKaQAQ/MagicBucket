@@ -43,10 +43,11 @@ internal sealed class HudActions
 }
 
 /// <summary>
-/// KTK 运行时桥（触发中 / 自动前往 / 主窗 / 设置面板四个原生窗口共用一次 KTK 初始化）。生命周期：
+/// KTK 运行时桥（触发中 / 自动前往 / 主窗 / 设置面板 / 历史记录五个原生窗口共用一次 KTK 初始化）。生命周期：
 ///   BeginInit（插件构造，异步启动 InitializeAsync）
-///   → Tick / TickAuto / TickMain / TickSettings（每帧，框架主线程）→ Shutdown。
-/// HUD 异常置 failed，自动前往置 autoFailed，主窗置 mainFailed，各自回退对应 ImGui 窗口。
+///   → Tick / TickAuto / TickMain / TickSettings / TickHistory（每帧，框架主线程）→ Shutdown。
+/// v1.2.12：第 5 窗历史记录同样纳入 SetXxxWindowOpen / RestoreAfterTeleport / ReviveAfterError，
+/// 遵守 v1.2.11「原来开着几个窗就保持几个、插件不得替用户点亮任何窗口」。
 /// </summary>
 internal sealed class NativeHudRuntime
 {
@@ -61,35 +62,41 @@ internal sealed class NativeHudRuntime
     private readonly AutoWindowActions autoActions;
     private readonly MainActions mainActions;
     private readonly SettingsActions settingsActions;
+    private readonly HistoryActions historyActions;
     private readonly Action<string> log;
     private Task? initTask;
     private HudWindow? window;
     private AutoWindow? autoWindow;
     private MainWindow? mainWindow;
     private SettingsWindow? settingsWindow;
+    private NativeHistoryWindow? historyWindow;
     private bool failed;
     private bool autoFailed;
     private bool mainFailed;
     private bool settingsFailed;
+    private bool historyFailed;
     private bool disposed;
     private DateTime lastSyncUtc = DateTime.MinValue;
     private DateTime lastAutoSyncUtc = DateTime.MinValue;
     private DateTime lastMainSyncUtc = DateTime.MinValue;
     private DateTime lastSettingsSyncUtc = DateTime.MinValue;
+    private DateTime lastHistorySyncUtc = DateTime.MinValue;
     private DateTime lastTickErrorLogUtc = DateTime.MinValue;   // v1.2.10：Tick* 异常日志限频
 
     internal NativeHudRuntime(HudActions actions, AutoWindowActions autoActions,
                               MainActions mainActions, SettingsActions settingsActions,
-                              Action<string> log)
+                              HistoryActions historyActions, Action<string> log)
     {
         this.actions = actions;
         this.autoActions = autoActions;
         this.mainActions = mainActions;
         this.settingsActions = settingsActions;
+        this.historyActions = historyActions;
         this.log = log;
         MainWindow.Logger = log;   // 让主窗内部的异常/降级日志也进 /xllog
         SettingsWindow.Logger = log;   // v1.2.7 设置面板同理
         HudWindow.Logger = log;        // v1.2.10 触发悬浮窗节点初始化失败也要能定位
+        NativeHistoryWindow.Logger = log;   // v1.2.12 历史窗同理
     }
 
     /// <summary>「触发中」原生 HUD 窗口已成功初始化并接管（旧版 ImGui 触发悬浮窗已彻底废弃，不再绘制）。</summary>
@@ -261,8 +268,9 @@ internal sealed class NativeHudRuntime
         this.autoFailed = false;
         this.mainFailed = false;
         this.settingsFailed = false;
+        this.historyFailed = false;
         this.lastSyncUtc = this.lastAutoSyncUtc = this.lastMainSyncUtc =
-            this.lastSettingsSyncUtc = DateTime.MinValue;
+            this.lastSettingsSyncUtc = this.lastHistorySyncUtc = DateTime.MinValue;
     }
 
     // ───────── v1.2.9：窗口状态直驱（指令 / 落地恢复专用，绝无强锁） ─────────
@@ -278,16 +286,19 @@ internal sealed class NativeHudRuntime
         this.ForceOne(this.autoWindow, open, "自动前往窗", () => { this.lastAutoSyncUtc = DateTime.MinValue; });
     internal void SetSettingsWindowOpen(bool open) =>
         this.ForceOne(this.settingsWindow, open, "设置面板", () => { this.lastSettingsSyncUtc = DateTime.MinValue; });
+    internal void SetHistoryWindowOpen(bool open) =>
+        this.ForceOne(this.historyWindow, open, "历史窗口", () => { this.lastHistorySyncUtc = DateTime.MinValue; });
 
     /// <summary>落地恢复：只把快照里原本开着的窗口拉回来，原本关着的不动。
-    /// v1.2.11：设置面板也纳入快照，四个窗口一律按用户原本的状态保持。</summary>
-    internal void RestoreAfterTeleport(bool main, bool hud, bool auto, bool settings)
+    /// v1.2.12：五个窗口（含历史）一律按用户原本的状态保持，插件不替用户点亮任何窗口。</summary>
+    internal void RestoreAfterTeleport(bool main, bool hud, bool auto, bool settings, bool history)
     {
         if (this.disposed) return;
         if (main) this.SetMainWindowOpen(true);
         if (hud) this.SetHudWindowOpen(true);
         if (auto) this.SetAutoWindowOpen(true);
         if (settings) this.SetSettingsWindowOpen(true);
+        if (history) this.SetHistoryWindowOpen(true);
     }
 
     private void ForceOne(NativeAddon? w, bool open, string name, Action resetThrottle)
@@ -337,6 +348,10 @@ internal sealed class NativeHudRuntime
             case SettingsWindow sw:
                 sw.SuppressClosed = true;
                 try { sw.Close(); } finally { sw.SuppressClosed = false; }
+                break;
+            case NativeHistoryWindow nw:
+                nw.SuppressClosed = true;
+                try { nw.Close(); } finally { nw.SuppressClosed = false; }
                 break;
             default:
                 w.Close();
@@ -397,6 +412,60 @@ internal sealed class NativeHudRuntime
     /// <summary>v1.2.7：跳过设置面板 200ms 节流，下一帧立即重画。</summary>
     internal void ForceSettingsRefresh() => this.lastSettingsSyncUtc = DateTime.MinValue;
 
+    /// <summary>
+    /// v1.2.12：S 怪历史窗口（第 5 窗）。与其余四窗共用一次 KTK 初始化，独立 200ms 节流。
+    /// 单窗异常只记限频日志、下一帧重试，绝不设共享 failed、绝不主动 Close（v1.2.10 铁律）。
+    /// </summary>
+    internal void TickHistory(bool wantOpen, HistorySnapshot s)
+    {
+        if (!Enabled || this.failed || this.historyFailed || this.disposed) return;
+        try
+        {
+            if (this.historyWindow is null)
+            {
+                if (!this.InitReady()) return;
+                this.historyWindow = new NativeHistoryWindow(this.historyActions)
+                {
+                    InternalName = "MagicBucketNativeHistory",
+                    Title = "魔法水桶 · S 怪历史",
+                    Size = new Vector2(NativeHistoryWindow.W, NativeHistoryWindow.H),
+                };
+                this.log("[原生UI] 历史窗口已就绪");
+            }
+
+            if (!wantOpen)
+            {
+                if (this.historyWindow.IsOpen)
+                {
+                    this.historyWindow.SuppressClosed = true;
+                    try { this.historyWindow.Close(); }
+                    finally { this.historyWindow.SuppressClosed = false; }
+                }
+                return;
+            }
+
+            if (!this.historyWindow.IsOpen)
+            {
+                this.historyWindow.Open();
+                this.lastHistorySyncUtc = DateTime.MinValue;   // 刚打开立刻刷一次，别等节流
+            }
+            if ((DateTime.UtcNow - this.lastHistorySyncUtc).TotalMilliseconds < 200) return;
+            this.lastHistorySyncUtc = DateTime.UtcNow;
+            if (this.historyWindow.IsOpen) this.historyWindow.Apply(s);
+        }
+        catch (Exception ex)
+        {
+            if ((DateTime.UtcNow - this.lastTickErrorLogUtc).TotalSeconds >= 5)
+            {
+                this.lastTickErrorLogUtc = DateTime.UtcNow;
+                this.log($"[原生UI] 历史窗口本帧刷新异常，已跳过并重试：{ex}");
+            }
+        }
+    }
+
+    /// <summary>新记录写入 / 筛选 / 翻页 / 清空后，跳过 200ms 节流下一帧立即重画。</summary>
+    internal void ForceHistoryRefresh() => this.lastHistorySyncUtc = DateTime.MinValue;
+
     internal void Shutdown()
     {
         if (this.disposed) return;
@@ -421,10 +490,20 @@ internal sealed class NativeHudRuntime
             }
         }
         catch { /* 同上 */ }
+        try
+        {
+            if (this.historyWindow is { } hw)
+            {
+                hw.SuppressClosed = true;
+                hw.Close();
+            }
+        }
+        catch { /* 同上 */ }
         this.window = null;
         this.autoWindow = null;
         this.mainWindow = null;
         this.settingsWindow = null;
+        this.historyWindow = null;
         if (this.initTask is { IsCompletedSuccessfully: true })
         {
             try { KamiToolKitLibrary.Dispose(); }
