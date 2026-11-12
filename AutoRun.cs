@@ -97,6 +97,9 @@ public sealed partial class Plugin
     private AutoJob? autoJob;
     private DateTime autoHitHandledAt;   // 同一条提示只处理一次（聊天钩子和调度之间有时间差）
 
+    /// <summary>v1.2.12：途中「已被触发」拦截的扫描节流（UTC 秒，1 秒一次）。</summary>
+    private long autoTriggerCheckAt;
+
     /// <summary>本次运行里已经触发成功的组合，收工后一起报给用户。</summary>
     private readonly List<(string world, string cn)> autoHits = new();
 
@@ -237,14 +240,24 @@ public sealed partial class Plugin
         var order = worlds
             .OrderBy(w => string.Equals(w, curWorld, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
             .ToList();
+        var trigSkipped = new HashSet<string>(StringComparer.Ordinal);
         foreach (var w in order)
         {
             foreach (var h in candidates)
             {
                 if (this.autoOnlyOpen && !openAt[h.cn].Contains(w)) continue;
+                // v1.2.12：已被他人触发的（Sonar 报过出生 / 主站播报过）根本不进队列。
+                // 同一只怪可能在多个服被跳过，这里按怪名去重，汇总只记一次。
+                if (this.IsTriggered(h.en, w))
+                {
+                    trigSkipped.Add(h.cn);
+                    continue;
+                }
                 this.autoQueue.Add(new AutoJob(w, h.cn, h.en, h.map));
             }
         }
+        foreach (var cn in trigSkipped)
+            this.autoSkipped.Add((cn, "已被触发", "聊天栏/主站已报这只 S，跳过"));
 
         if (this.autoQueue.Count == 0)
         {
@@ -351,6 +364,22 @@ public sealed partial class Plugin
     private void AutoStep()
     {
         if (!this.autoRunning) return;
+        if (this.autoIdx >= this.autoQueue.Count)
+        {
+            this.AutoFinish();
+            return;
+        }
+
+        // v1.2.12：起跑前先剔掉「已被他人触发」的任务 —— 排队期间可能刚被播报，
+        // 直接跳过，不白传一次跨服。用 while 而不是递归 AutoStep，避免连跳几十只把栈压深。
+        while (this.autoIdx < this.autoQueue.Count)
+        {
+            var cand = this.autoQueue[this.autoIdx];
+            if (!this.IsTriggered(cand.HuntEn, cand.World)) break;
+            this.autoIdx++;
+            this.autoSkipped.Add((cand.HuntCn, "已被触发", $"出发前发现已被他人触发（{cand.World}）"));
+            this.Print($"[自动前往] {cand.World} · {cand.HuntCn} 已触发，跳过（不出门）");
+        }
         if (this.autoIdx >= this.autoQueue.Count)
         {
             this.AutoFinish();
@@ -864,6 +893,36 @@ public sealed partial class Plugin
         this.autoJob = null;
         this.autoStatus = "继续队列…";
         this.Print($"[自动前往] 继续队列（还剩 {Math.Max(0, this.autoQueue.Count - this.autoIdx)} 个任务）");
+        this.AutoStep();
+    }
+
+    /// <summary>
+    /// v1.2.12：自动前往途中「这只突然被拉黑」的急停。
+    /// 触发来源只有 Sonar 聊天播报（异步到主线程）和主站信号两种，所以每帧扫一次、按秒节流就够。
+    /// 一旦命中：立刻 StopAll 掐断 vnav 寻路 / 传送 / 点位动作，记一笔跳过，直接开下一个任务。
+    /// 不做「等这只打完再走」之类的判断 —— 用户口径是「只要被触发了，本插件就不能再去」。
+    /// </summary>
+    private void TickTriggeredGuard()
+    {
+        if (!this.autoRunning) return;
+        var job = this.autoJob;
+        if (job is null) return;
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (now <= this.autoTriggerCheckAt) return;   // 1 秒一次，Sonar 播报本来就有延迟
+        this.autoTriggerCheckAt = now;
+        if (!this.IsTriggered(job.HuntEn, job.World)) return;
+
+        this.autoTriggerCheckAt = 0;
+        this.autoGen++;
+        this.autoToken++;
+        try { this.StopAll(true); } catch { }        // 取消寻路 / 传送 / 采集 / 自爆循环
+
+        this.autoSkipped.Add((job.HuntCn, "已被触发", $"途中监听到该 S 已被他人触发（{job.World}）"));
+        this.Print($"[自动前往] {job.World} · {job.HuntCn} 已触发，跳过（取消寻路，去下一个）");
+        this.autoHit = "";
+        this.autoJob = null;
+        this.autoStatus = $"跳过 {job.HuntCn}（已被触发），去下一个…";
         this.AutoStep();
     }
 
