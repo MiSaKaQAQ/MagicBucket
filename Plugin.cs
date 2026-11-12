@@ -270,9 +270,17 @@ public sealed partial class Plugin : IDalamudPlugin
     private bool mainWindowOpen = true;
     /// <summary>v1.2.7：原生 KTK 设置面板开关（主窗齿轮切换）。</summary>
     private bool settingsWindowOpen;
-    /// <summary>v1.2.7：窗口隐藏保护截止时刻。触发 / 传送期间游戏会临时 hide 所有自定义 addon，
-    /// 保护期内的 OnHide 一律不算「用户主动关窗」。</summary>
-    private DateTime nativeHideGuardUntil = DateTime.MinValue;
+    /// <summary>v1.2.8 窗口强锁：true = 正在「自动前往 / 执行触发」会话中。
+    /// 为 true 时：① 所有 OnHide 一律不得把 mainWindowOpen / autoHudOpen / autoRunOpen 写成 false；
+    /// ② Framework_OnUpdate 每帧把这三个开关强制拉回 true；
+    /// ③ 被游戏 hide 过的窗口，下一帧由 NativeHudRuntime.ForceReopenAll() 强制重新 Open。
+    /// 只有「停止整队 / 全部走完 / 插件卸载 / /水桶 unlock」才解锁。</summary>
+    public static volatile bool IsAutoRunning = false;
+    /// <summary>强锁期间被 OnHide 隐藏过的窗口位掩码（1=HUD / 2=自动前往 / 4=主窗 / 8=设置面板）。
+    /// 下一帧 ForceReopenAll 只复活对应窗口，避免无条件 Open 没被隐藏的窗口。</summary>
+    internal static volatile int NativeReopenMask;
+    /// <summary>强锁开启时刻：异常中断兜底，队列已停且挂满 4 小时自动解锁，避免窗口永久关不掉。</summary>
+    private static DateTime autoLockSinceUtc = DateTime.MinValue;
     /// <summary>「停止」令牌：每次点停止 +1，之前排进队列的延时任务全部作废。</summary>
     private int runGen;
     /// <summary>硬停止开关：停止后连「已经排到框架线程上、还没来得及发」的命令也一并拦掉。
@@ -403,6 +411,8 @@ public sealed partial class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        // v1.2.8：静态字段跨插件重载存活，卸载时必须复位，否则新实例一上来就是强锁状态。
+        this.ReleaseAutoLock("插件卸载");
         try { this.SavePrefs(); } catch { /* 卸载时也别把筛选丢了 */ }
         this.commandManager.RemoveHandler(CommandName);
         this.commandManager.RemoveHandler(CommandAlias);
@@ -519,6 +529,17 @@ public sealed partial class Plugin : IDalamudPlugin
                 this.SaveAutoSettings();
                 this.Print($"倒地自动点「确定」返回：{(this.autoConfirmReturn ? "已开启" : "已关闭")}" +
                            (this.autoConfirmReturn ? "（副本里想躺平等复活就先关掉）" : ""));
+                return;
+            case "unlock":
+            case "解锁":
+            case "解窗口锁":
+                this.ReleaseAutoLock("手动解锁（/水桶 unlock）");
+                this.Print("窗口强锁已解除：现在可以正常关闭主窗 / 触发悬浮窗 / 自动前往窗");
+                return;
+            case "lock":
+            case "锁窗":
+                this.EnterAutoLock("手动上锁（/水桶 lock）");
+                this.Print("窗口强锁已开启：跨服 / 过图时三个原生窗口会被强制拉回；/水桶 unlock 解除");
                 return;
             case "stop":
             case "halt":
@@ -645,9 +666,9 @@ public sealed partial class Plugin : IDalamudPlugin
     private GotoResult Goto(string map, float x, float y, string world, int line,
         string huntCn = "", bool nav = false, List<Pt>? route = null)
     {
-        // v1.2.7：跨服 / 传送会触发过图，游戏临时隐藏所有自定义 addon；开启窗口保护，
-        // 免得落地后主窗 / 触发悬浮窗 / 自动前往窗全部消失。
-        this.GuardNativeWindows(TimeSpan.FromMinutes(3));
+        // v1.2.8 强锁：跨服 / 传送会触发过图，游戏临时隐藏所有自定义 addon。
+        // 从这里起整条自动化会话的窗口一律不许被关掉（不再依赖 BetweenAreas 或时间窗）。
+        this.EnterAutoLock("前往 / 跨服传送");
         this.Resume();          // 上一次点过停止也没关系，这是一次新的动作
         var fr = this.Flag(map, x, y);
         if (!fr.Ok) return new GotoResult(false, fr.Message);
@@ -2656,8 +2677,8 @@ public sealed partial class Plugin : IDalamudPlugin
     /// 给没有触发点数据的 S（俄菲翁尼厄斯、戾虫那几只）兜底用。</summary>
     private GotoResult GotoAetheryte(string map, string world, string huntCn = "")
     {
-        // v1.2.7：同上，传大水晶同样是过图动作，窗口开关要保护起来
-        this.GuardNativeWindows(TimeSpan.FromMinutes(3));
+        // v1.2.8 强锁：传大水晶同样是过图动作，整条会话窗口常驻
+        this.EnterAutoLock("传送大水晶");
         this.Resume();
         var ae = this.NearestAetheryte(map, 0f, 0f, huntCn);
         var needTravel = !string.IsNullOrWhiteSpace(world) &&
@@ -3547,6 +3568,23 @@ public sealed partial class Plugin : IDalamudPlugin
 
     private void Framework_OnUpdate(IFramework framework)
     {
+        // v1.2.8 强锁（强制复活）：放在整个业务 try 之外，不依赖任何调用成功、不受 200ms 节流影响。
+        // ① 每帧把三个窗口开关无条件拉回 true，Tick* 这一帧一定拿到 wantOpen=true；
+        // ② 被游戏 hide 过的窗口，绕过 IsOpen 缓存无条件重新 Open，真正「下一帧拉回来」。
+        if (IsAutoRunning)
+        {
+            this.mainWindowOpen = true;
+            this.autoHudOpen = true;
+            this.autoRunOpen = true;
+            // 异常中断兜底：队列已经不跑、强锁却挂满 4 小时 → 自动解锁。
+            // 跨服传送 / 正常触发都远短于 4 小时，不影响「坚如磐石」。
+            if (!this.autoRunning && !this.autoPaused &&
+                autoLockSinceUtc != DateTime.MinValue &&
+                (DateTime.UtcNow - autoLockSinceUtc).TotalHours >= 4)
+                this.ReleaseAutoLock("会话超时自动解锁");
+            try { this.nativeHud?.ForceReopenAll(this.settingsWindowOpen); }
+            catch { /* 复活失败不能拖垮每帧调度 */ }
+        }
         try
         {
             if (this.autoSummonMinion) this.TryAutoSummon();
@@ -3563,30 +3601,35 @@ public sealed partial class Plugin : IDalamudPlugin
         catch { /* 每帧跑，任何异常都吞掉 */ }
     }
 
-    // ───────────── v1.2.7：过图隐藏 addon 的窗口保护 ─────────────
-    /// <summary>发起触发 / 传送 / 跨服时调用：接下来一段时间里，游戏因过图隐藏自定义 addon
-    /// 触发的 OnHide 都不写回窗口开关，Tick* 会在落地后自动把窗口重新打开。</summary>
-    private void GuardNativeWindows(TimeSpan duration)
+    // ───────────── v1.2.8：窗口强锁（彻底替换 v1.2.7 的时间窗护盾） ─────────────
+    // 【旧方案为什么没拦住 BetweenAreas】
+    //   ① 「执行触发」链路 MainPrimary / Goto / GotoAetheryte 根本不设置 autoRunning，
+    //      旧护盾的第一个判据对这条链路永远是 false；
+    //   ② 跨服传送落地之后 BetweenAreas 已经复位、IsLoggedIn=true、LocalPlayer 已存在，
+    //      而游戏的批量 hide 恰恰常在落地清理阶段才回调 OnHide → 第二个判据也失效；
+    //   ③ 保护期是绝对时间（3 / 10 分钟），跨服排队 + 加载很容易超时，第三个判据同样失效。
+    //   三个判据同时落空，OnHide 就把 mainWindowOpen / autoHudOpen / autoRunOpen 写成 false。
+    // 【更隐蔽的一层】游戏 hide addon 时 KTK 的 IsOpen 可能仍是 true，
+    //   即使开关没被写脏，Tick* 里「wantOpen 且窗口未打开」的判断也不会重新 Open，窗口照样不回来。
+    //   所以新方案三管齐下：无条件锁（不看 BetweenAreas）+ 每帧强制开关 + 强制重新 Open。
+    /// <summary>进入自动化会话：开启强锁。幂等，整条触发链里反复调用也只记一次日志。</summary>
+    private void EnterAutoLock(string why)
     {
-        var until = DateTime.UtcNow + duration;
-        if (until > this.nativeHideGuardUntil) this.nativeHideGuardUntil = until;
+        if (IsAutoRunning) return;
+        IsAutoRunning = true;
+        NativeReopenMask = 0;
+        autoLockSinceUtc = DateTime.UtcNow;
+        try { this.log.Info("[魔法水桶] 窗口强锁已开启：" + why); } catch { }
     }
 
-    /// <summary>判断本次 OnHide 是不是「游戏临时隐藏」而不是「用户主动关窗」。</summary>
-    private bool ShouldIgnoreNativeClose()
+    /// <summary>会话彻底结束 / 异常中断 / 手动解锁：解除强锁，窗口恢复可正常关闭。</summary>
+    private void ReleaseAutoLock(string why)
     {
-        // ① 自动前往 / 触发队列正在跑：三个主窗必须常驻，窗口开关不能被 hide 清掉
-        if (this.autoRunning || this.autoPaused) return true;
-        // ② 过图 / 切服瞬间：BetweenAreas、LocalPlayer 为空或还没登录，游戏会批量隐藏自定义 addon
-        try
-        {
-            if (!this.clientState.IsLoggedIn) return true;
-            if (this.condition[ConditionFlag.BetweenAreas]) return true;
-            if (this.objectTable.LocalPlayer is null) return true;
-        }
-        catch { return true; }
-        // ③ 刚发起过触发 / 传送：给一段保护期，覆盖落地前后多次 hide/show
-        return DateTime.UtcNow < this.nativeHideGuardUntil;
+        if (!IsAutoRunning) return;
+        IsAutoRunning = false;
+        NativeReopenMask = 0;
+        autoLockSinceUtc = DateTime.MinValue;
+        try { this.log.Info("[魔法水桶] 窗口强锁已解除：" + why); } catch { }
     }
 
     // ───────────── v1.1.71/72 原生窗口：桥接方法 ─────────────
@@ -3630,7 +3673,9 @@ public sealed partial class Plugin : IDalamudPlugin
         // 主窗口独立失败开关：切完整版 / 收起时 wantOpen=false，由 Runtime 主动 Close。
         try
         {
-            var wantMain = this.mainWindowOpen && !this.miniMode && !this.legacyMainOpen;
+            // v1.2.8 强锁：miniMode / legacyMainOpen 是 v1.2.6 之前旧 ImGui 的残留开关，
+            // 强锁期间一律忽略，否则 TickMain 会拿到 wantOpen=false 主动把主窗 Close 掉。
+            var wantMain = IsAutoRunning || (this.mainWindowOpen && !this.miniMode && !this.legacyMainOpen);
             h.TickMain(wantMain, this.BuildMainSnapshot());
         }
         catch (Exception ex)
@@ -3814,7 +3859,8 @@ public sealed partial class Plugin : IDalamudPlugin
         // v1.2.7：过图 / 跨服时游戏会临时隐藏所有自定义 addon，OnHide → Closed() 会把开关
         // 永久写成 false，导致「点开始触发后所有窗口都消失且再也回不来」。保护期内忽略回写，
         // TickMain 在过图结束后会自动把窗口重新 Open。
-        Closed = () => { if (!this.ShouldIgnoreNativeClose()) this.mainWindowOpen = false; },
+        // v1.2.8 强锁：最顶层拦截，自动化会话中绝不把主窗开关写死为 false。
+        Closed = () => { if (IsAutoRunning) return; this.mainWindowOpen = false; },
     };
 
     /// <summary>复刻 DrawHuntList 的筛选/聚合逻辑，产出原生主窗口的纯数据快照。</summary>
@@ -4000,12 +4046,13 @@ public sealed partial class Plugin : IDalamudPlugin
     /// <summary>主按钮 / 特殊目的地：复刻原 ImGui 展开行里的前往绿点 / 大水晶 / 丢弃 / 顾尼图逻辑。</summary>
     private void MainPrimary(string en, string world)
     {
-        // v1.2.7：点「执行触发」先开窗口保护，覆盖顾尼图这种不走 Goto 的特殊触发链
-        this.GuardNativeWindows(TimeSpan.FromMinutes(3));
+        // v1.2.8 强锁：点「执行触发」立即上锁，覆盖顾尼图这种不走 Goto 的特殊触发链。
+        // 旧版这里只给了 3 分钟保护期，且本链路根本不设置 autoRunning，护盾必然失效。
+        this.EnterAutoLock("执行触发");
         var data = this.srankData?.data;
-        if (data is null) return;
+        if (data is null) { this.ReleaseAutoLock("执行触发失败：数据未就绪"); return; }
         var h = data.hunts.FirstOrDefault(x => x.en == en);
-        if (h is null) return;
+        if (h is null) { this.ReleaseAutoLock("执行触发失败：找不到该 S"); return; }
         var pw = world;
 
         var greens = this.GreensFor(h, pw);
@@ -6760,6 +6807,9 @@ public sealed partial class Plugin : IDalamudPlugin
     /// <summary>手动停止：作废所有排队中的动作 + 拦住后续命令 + 让 vnav 停下来。相当于把自动化整个取消。</summary>
     private void StopAll(bool quiet = false)
     {
+        // v1.2.8：玩家主动「停止」＝自动化会话结束，解除强锁，窗口恢复可关闭。
+        // quiet=true 是队列内部调用（暂停 / 跳过 / 收工），由 AutoStop / AutoFinish 自行决定解锁时机。
+        if (!quiet) this.ReleaseAutoLock("手动停止");
         this.halted = true;      // 先立旗：此后 Say() 不再放行任何自动化命令
         this.runGen++;
         this.Say("/vnav stop", force: true);
