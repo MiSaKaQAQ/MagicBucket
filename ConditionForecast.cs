@@ -28,6 +28,13 @@ internal static class ConditionForecast
     private const double HorizonWeather = 700000;  // 天气型：约 8 天（小雨/薄雾这种低概率天气要等）
     private const int DaysAhead = 320;             // ET 日枚举上限：必须 > 32，否则漏整个月相周期
 
+    // 月相基准偏移（单位：艾欧泽亚日）。真实游戏的新月(dom 1) 未必落在 Unix 纪元；
+    // 设为使真实新月对齐的 ET 日数（正数 = 把新月提前）。实测 11-13 应为新月日 2-4
+    // （夺心魔 ET17:00~次日03:00 = 10 ET 小时 ≈ 29 真实分钟），但旧基准把 11-13 算成新月日1
+    // （窗口 27 ET 小时 ≈ 79 分钟，错误）。偏移 +2 使 11-13 落到新月日3，套用日2-4 规则 →
+    // 窗口 03:29~03:58（与玩家实测吻合）。与 bot trigger_forecast.py 的 MOON_EPOCH_OFFSET=2 保持一致。
+    private const int MoonEpochOffset = 2;
+
     public readonly record struct Window(double Start, double End, string Name);
 
     private sealed class Spec
@@ -39,6 +46,7 @@ internal static class ConditionForecast
         public string[] Include = Array.Empty<string>();
         public string[] Exclude = Array.Empty<string>();
         public (double From, double To)[] Hours = Array.Empty<(double, double)>();  // ET 小时，To 可 >24
+        public (double From, double To)[] FirstDayHours = Array.Empty<(double, double)>();  // 新月日1 专用 ET 时段（其余日用 Hours）
         public Func<int, bool> DayFilter = _ => true;
         public string[] Weather = Array.Empty<string>();          // ET 窗口内还要同时命中的天气
         public string Label = "";                                 // 悬浮提示里用的原始条件描述
@@ -93,9 +101,13 @@ internal static class ConditionForecast
         "星4月", "灵4月", "星5月", "灵5月", "星6月", "灵6月",
     };
 
-    private static bool NewMoon(int dayCount) => dayCount % 32 + 1 is >= 1 and <= 4;
-    private static bool FullMoon16to19(int dayCount) => dayCount % 32 + 1 is >= 16 and <= 19;
-    private static bool FullMoon16(int dayCount) => dayCount % 32 + 1 == 16;
+    // 带月相基准偏移的 ET 月内日（1..32）。offset 处理负数 dayCount（d0-1 回看一天）。
+    private static int MoonDay(int dayCount)
+        => (((dayCount + MoonEpochOffset) % 32) + 32) % 32 + 1;
+
+    private static bool NewMoon(int dayCount) => MoonDay(dayCount) is >= 1 and <= 4;
+    private static bool FullMoon16to19(int dayCount) => MoonDay(dayCount) is >= 16 and <= 19;
+    private static bool FullMoon16(int dayCount) => MoonDay(dayCount) == 16;
 
     /* 13 只有条件窗口的 S（键是 srank_data.json 的 en，和熊站 case 一一对应）。
        改规则和 srank_trigger.py 的 TRIGGER_SPEC 保持同步，两边算出来的窗口必须一样。 */
@@ -132,9 +144,9 @@ internal static class ConditionForecast
         // ── ET 日期（月相）型 ──
         ["Mindflayer"] = new()      // 夺心魔：新月日 1 是 00:00 起，日 2–4 是 17:00 起
         {
-            Kind = "et_window", Hours = new[] { (0.0, 27.0), (17.0, 27.0) },
+            Kind = "et_window", Hours = new[] { (17.0, 27.0) }, FirstDayHours = new[] { (0.0, 27.0) },
             DayFilter = NewMoon, Horizon = HorizonMoon,
-            Label = "新月（ET 日 1–4）",
+            Label = "新月：日1 00:00–次日03:00；日2–4 17:00–次日03:00",
         },
         ["Croakadile"] = new()      // 咕尔呱洛斯：满月 ET 日 16–19 的 17:00 起
         {
@@ -287,7 +299,10 @@ internal static class ConditionForecast
         for (var d = d0 - 1; d < d0 + DaysAhead; d++)
         {
             if (!sp.DayFilter((int)d)) continue;
-            foreach (var (from, to) in sp.Hours)
+            var dom = MoonDay((int)d);
+            // 新月日1 用 FirstDayHours（如夺心魔 00:00–次日03:00），其余日用 Hours（日2-4 的 17:00–次日03:00）
+            var hours = (sp.FirstDayHours.Length > 0 && dom == 1) ? sp.FirstDayHours : sp.Hours;
+            foreach (var (from, to) in hours)
             {
                 var s = d * EtDay + from * EtHour;
                 var e = d * EtDay + to * EtHour;
