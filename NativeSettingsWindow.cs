@@ -183,6 +183,13 @@ internal sealed class SettingsWindow : NativeAddon
     protected override unsafe void OnHide(AtkUnitBase* addon)
     {
         base.OnHide(addon);
+        // v1.2.8 强锁：会话中被过图 hide 时不回写，由 ForceReopenAll 复活；
+        // 面板内「关闭」按钮走 actions.Closed() 直接置 settingsWindowOpen=false，仍可正常关闭。
+        if (Plugin.IsAutoRunning)
+        {
+            Plugin.NativeReopenMask |= 8;   // bit3 = 设置面板
+            return;
+        }
         // 程序内主动 Close() 时由 Runtime 置 SuppressClosed，避免把开关回写成 false 后又重开。
         if (!this.SuppressClosed) this.actions.Closed();
     }
