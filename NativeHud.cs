@@ -11,12 +11,12 @@ namespace SrankFlag;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // v1.1.71 试点 / v1.1.72 扩展：把「触发中」与「自动前往」两个窗口换成游戏原生窗口。
-// KTK 相关类型集中在 NativeHud.cs + NativeAutoWindow.cs；整体撤销：
-//   把 NativeHudRuntime.Enabled 改成 false → 两个窗口都回退 ImGui；
-//   只想撤「自动前往」→ 把 NativeHudRuntime.EnabledAuto 改成 false。
-// KamiToolKitLibrary 是全局静态，只能初始化 / 释放一次，所以两个窗口共用本 Runtime。
+// KTK 相关类型集中在 NativeHud.cs + NativeAutoWindow.cs。
+// v1.2.5：自动前往 / 触发中两个窗口的 ImGui 兜底版已彻底删除（DrawAutoWindow / DrawAutoHud 不再存在），
+// 只保留原生 KTK 窗口；若 KTK 初始化或运行失败，该窗口直接不显示，绝不再回退 ImGui 避免串台。
+// 主窗口（MagicBucket）仍保留 ImGui 兜底：KTK 主窗不可用时降级回 ImGui 主窗，由 ActiveMain 控制。
+// KamiToolKitLibrary 是全局静态，只能初始化 / 释放一次，所以窗口共用本 Runtime。
 // 运行期依赖：插件目录需有 KamiToolKit.dll + FFXIVClientStructs.Expansion.dll。
-// 任一窗口初始化 / 运行失败只停用那一个（failed / autoFailed），另一个照常工作。
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// <summary>「触发中」悬浮窗的纯数据快照。刻意不含任何 KTK 类型。</summary>
@@ -82,23 +82,16 @@ internal sealed class NativeHudRuntime
         MainWindow.Logger = log;   // 让主窗内部的异常/降级日志也进 /xllog
     }
 
-    /// <summary>「触发中」原生窗口已接管（此时 DrawAutoHud 不再画 ImGui）。</summary>
+    /// <summary>「触发中」原生 HUD 窗口已成功初始化并接管（旧版 ImGui 触发悬浮窗已彻底废弃，不再绘制）。</summary>
     internal bool Active => Enabled && !this.failed && !this.disposed && this.window is not null;
 
-    /// <summary>「自动前往」原生窗口已接管（此时 DrawAutoWindow 不再画 ImGui）。</summary>
+    /// <summary>「自动前往」原生窗口已成功初始化并接管（旧版 ImGui 自动前往窗已彻底废弃，不再绘制）。</summary>
     internal bool ActiveAuto => Enabled && EnabledAuto && !this.failed && !this.autoFailed &&
                                 !this.disposed && this.autoWindow is not null;
 
     /// <summary>「主窗口」原生窗口已接管（此时 DrawMainWindow 跳过 ImGui 主窗）。</summary>
     internal bool ActiveMain => Enabled && EnabledMain && !this.failed && !this.mainFailed &&
                                 !this.disposed && this.mainWindow is not null;
-
-    /// <summary>KTK「自动前往」窗口不可用（KTK 初始化失败，或该窗口自身异常）→ 由 ImGui 版 DrawAutoWindow 兜底。
-    /// 仅在为 true 时才允许 Plugin.DrawMainWindow 画 ImGui 自动前往窗，避免与 KTK 原生窗口「串台」。</summary>
-    internal bool AutoFallback => this.failed || this.autoFailed;
-
-    /// <summary>KTK「触发中」HUD 不可用（KTK 初始化失败，或 HUD 自身异常）→ 由 ImGui 版 DrawAutoHud 兜底。</summary>
-    internal bool HudFallback => this.failed;
 
     /// <summary>KTK 初始化是否已经成功完成；失败时整体回退 ImGui。</summary>
     private bool InitReady()
