@@ -3597,7 +3597,13 @@ public sealed partial class Plugin : IDalamudPlugin
     // Close→Open 强制重建显示状态，不依赖 Draw、不依赖节流、不碰任何 ImGui API。
     private void ApplyMainWindowNow()
     {
-        try { this.nativeHud?.SetMainWindowOpen(this.mainWindowOpen); }
+        try
+        {
+            // v1.2.10 急救：指令优先。先清掉「单窗异常」软停用标志，
+            // 保证任何一次 /水桶 都能重新驱动原生窗口，不受之前某帧异常影响。
+            this.nativeHud?.ReviveAfterError();
+            this.nativeHud?.SetMainWindowOpen(this.mainWindowOpen);
+        }
         catch (Exception ex) { try { this.log.Warning(ex, "[魔法水桶] 主窗状态同步失败"); } catch { } }
     }
 
