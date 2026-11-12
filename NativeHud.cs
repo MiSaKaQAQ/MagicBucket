@@ -76,6 +76,7 @@ internal sealed class NativeHudRuntime
     private DateTime lastAutoSyncUtc = DateTime.MinValue;
     private DateTime lastMainSyncUtc = DateTime.MinValue;
     private DateTime lastSettingsSyncUtc = DateTime.MinValue;
+    private DateTime lastTickErrorLogUtc = DateTime.MinValue;   // v1.2.10：Tick* 异常日志限频
 
     internal NativeHudRuntime(HudActions actions, AutoWindowActions autoActions,
                               MainActions mainActions, SettingsActions settingsActions,
@@ -88,6 +89,7 @@ internal sealed class NativeHudRuntime
         this.log = log;
         MainWindow.Logger = log;   // 让主窗内部的异常/降级日志也进 /xllog
         SettingsWindow.Logger = log;   // v1.2.7 设置面板同理
+        HudWindow.Logger = log;        // v1.2.10 触发悬浮窗节点初始化失败也要能定位
     }
 
     /// <summary>「触发中」原生 HUD 窗口已成功初始化并接管（旧版 ImGui 触发悬浮窗已彻底废弃，不再绘制）。</summary>
@@ -161,8 +163,14 @@ internal sealed class NativeHudRuntime
         }
         catch (Exception ex)
         {
-            this.failed = true;
-            this.log($"[原生HUD] 运行异常，已停用并回退（无 ImGui 兜底）：{ex}");
+            // v1.2.10 急救：这里的 failed 是【全局】标志，四个 Tick* 和 /水桶 的 ForceOne 都检查它。
+            // 触发悬浮窗一次 NRE 会把主窗 / 自动前往窗 / 设置面板 / 斜杠指令一次性全部停掉。
+            // 改为只丢当前帧：日志 5 秒限频，下一帧按 200ms 节流自然重试，绝不永久停用。
+            if ((DateTime.UtcNow - this.lastTickErrorLogUtc).TotalSeconds >= 5)
+            {
+                this.lastTickErrorLogUtc = DateTime.UtcNow;
+                this.log($"[原生HUD] 本帧刷新异常，已跳过并重试（不影响其它窗口）：{ex}");
+            }
         }
     }
 
@@ -193,9 +201,12 @@ internal sealed class NativeHudRuntime
         }
         catch (Exception ex)
         {
-            this.autoFailed = true;
-            this.log($"[原生UI] 自动前往窗口异常，已停用并回退（无 ImGui 兜底）：{ex}");
-            try { this.autoWindow?.Close(); } catch { /* 忽略清理异常 */ }
+            // v1.2.10：单窗异常不再永久停用，也不主动 Close（那会直接把窗口干掉）。
+            if ((DateTime.UtcNow - this.lastTickErrorLogUtc).TotalSeconds >= 5)
+            {
+                this.lastTickErrorLogUtc = DateTime.UtcNow;
+                this.log($"[原生UI] 自动前往窗本帧刷新异常，已跳过并重试：{ex}");
+            }
         }
     }
 
@@ -231,14 +242,28 @@ internal sealed class NativeHudRuntime
         }
         catch (Exception ex)
         {
-            this.mainFailed = true;
-            this.log($"[原生UI] 主窗口异常，已停用并回退（无 ImGui 兜底）：{ex}");
-            try { this.mainWindow?.Close(); } catch { /* 忽略清理异常 */ }
+            // v1.2.10：单窗异常不再永久停用，也不主动 Close（那会直接把窗口干掉）。
+            if ((DateTime.UtcNow - this.lastTickErrorLogUtc).TotalSeconds >= 5)
+            {
+                this.lastTickErrorLogUtc = DateTime.UtcNow;
+                this.log($"[原生UI] 主窗口本帧刷新异常，已跳过并重试：{ex}");
+            }
         }
     }
 
     /// <summary>v1.1.98：ImGui 高级设置保存后，跳过主窗 200ms 节流，下一帧立即 Apply。</summary>
     internal void ForceMainRefresh() => this.lastMainSyncUtc = DateTime.MinValue;
+
+    /// <summary>v1.2.10 急救：清除「单窗异常」软停用标志，让 /水桶 立刻恢复驱动能力。
+    /// 只清软失败（autoFailed / mainFailed / settingsFailed），KTK 初始化失败的全局 failed 不动。</summary>
+    internal void ReviveAfterError()
+    {
+        this.autoFailed = false;
+        this.mainFailed = false;
+        this.settingsFailed = false;
+        this.lastSyncUtc = this.lastAutoSyncUtc = this.lastMainSyncUtc =
+            this.lastSettingsSyncUtc = DateTime.MinValue;
+    }
 
     // ───────── v1.2.9：窗口状态直驱（指令 / 落地恢复专用，绝无强锁） ─────────
     // 游戏过图会直接隐藏自定义 addon，但 KTK 的 IsOpen 缓存未必同步；
@@ -257,7 +282,7 @@ internal sealed class NativeHudRuntime
     /// <summary>落地恢复：只把快照里原本开着的窗口拉回来，原本关着的不动。</summary>
     internal void RestoreAfterTeleport(bool main, bool hud, bool auto)
     {
-        if (this.disposed || this.failed) return;
+        if (this.disposed) return;
         if (main) this.SetMainWindowOpen(true);
         if (hud) this.SetHudWindowOpen(true);
         if (auto) this.SetAutoWindowOpen(true);
@@ -266,7 +291,9 @@ internal sealed class NativeHudRuntime
     private void ForceOne(NativeAddon? w, bool open, string name, Action resetThrottle)
     {
         // 窗口还没懒建出来 → 只切 bool 即可，交给 Tick* 按开关自然创建并 Open。
-        if (w is null || this.disposed || this.failed) return;
+        // v1.2.10：指令优先。failed 只代表 KTK 初始化失败（那时 w 本来就是 null），
+        // 不应挡住 /水桶 对已创建窗口的驱动。
+        if (w is null || this.disposed) return;
         try
         {
             if (open)
@@ -356,9 +383,12 @@ internal sealed class NativeHudRuntime
         }
         catch (Exception ex)
         {
-            this.settingsFailed = true;
-            this.log($"[原生UI] 设置面板异常，已停用（无 ImGui 兜底）：{ex}");
-            try { this.settingsWindow?.Close(); } catch { /* 忽略清理异常 */ }
+            // v1.2.10：单窗异常不再永久停用，也不主动 Close。
+            if ((DateTime.UtcNow - this.lastTickErrorLogUtc).TotalSeconds >= 5)
+            {
+                this.lastTickErrorLogUtc = DateTime.UtcNow;
+                this.log($"[原生UI] 设置面板本帧刷新异常，已跳过并重试：{ex}");
+            }
         }
     }
 
@@ -405,6 +435,11 @@ internal sealed class NativeHudRuntime
 internal sealed class HudWindow : NativeAddon
 {
     private readonly HudActions actions;
+    // v1.2.10 急救：KTK 的 Open() 与 OnSetup 不保证同一帧完成，OnFinalize 也会清空节点引用。
+    // 缺这个守卫时，首次点「开始自动前往」会在按钮尚未创建时立刻 Apply → NRE →
+    // Tick 的 catch 把【全局】failed 置 true，四个原生窗口与 /水桶 一次性全部停摆。
+    private bool setupDone;
+    internal static Action<string>? Logger;
     private TextNode? badge;
     private TextNode? progress;
     private TextNode? job;
@@ -423,26 +458,39 @@ internal sealed class HudWindow : NativeAddon
 
     protected override unsafe void OnSetup(AtkUnitBase* addon, Span<AtkValue> atkValueSpan)
     {
-        SetWindowSize(new Vector2(360f, 300f));
-        var p = ContentStartPosition;
+        this.setupDone = false;
+        try
+        {
+            SetWindowSize(new Vector2(360f, 300f));
+            var p = ContentStartPosition;
 
-        this.badge = Text(p + new Vector2(0f, 0f), 340f, 20f, 14, "● 空闲");
-        this.progress = Text(p + new Vector2(150f, 0f), 190f, 20f, 12, "0/0");
-        this.job = Text(p + new Vector2(0f, 26f), 340f, 26f, 18, "还没开始触发");
-        this.map = Text(p + new Vector2(0f, 56f), 340f, 20f, 12, "");
-        this.next = Text(p + new Vector2(0f, 78f), 340f, 20f, 12, "");
-        this.status = Text(p + new Vector2(0f, 100f), 340f, 52f, 12, "");
-        this.hint = Text(p + new Vector2(0f, 158f), 340f, 18f, 11,
-            "关掉后：主窗「触发悬浮窗」按钮 或 /水桶 hud");
+            this.badge = Text(p + new Vector2(0f, 0f), 340f, 20f, 14, "● 空闲");
+            this.progress = Text(p + new Vector2(150f, 0f), 190f, 20f, 12, "0/0");
+            this.job = Text(p + new Vector2(0f, 26f), 340f, 26f, 18, "还没开始触发");
+            this.map = Text(p + new Vector2(0f, 56f), 340f, 20f, 12, "");
+            this.next = Text(p + new Vector2(0f, 78f), 340f, 20f, 12, "");
+            this.status = Text(p + new Vector2(0f, 100f), 340f, 52f, 12, "");
+            this.hint = Text(p + new Vector2(0f, 158f), 340f, 18f, 11,
+                "关掉后：主窗「触发悬浮窗」按钮 或 /水桶 hud");
 
-        this.primary = Button(p + new Vector2(0f, 182f), 166f, 28f, "继续队列",
-            () => this.actions.Primary());
-        this.skip = Button(p + new Vector2(174f, 182f), 166f, 28f, "停止这只，去下一个",
-            () => this.actions.Skip());
-        this.stop = Button(p + new Vector2(0f, 214f), 166f, 28f, "停止整队",
-            () => this.actions.Stop());
-        this.restart = Button(p + new Vector2(174f, 214f), 166f, 28f, "重新开始",
-            () => this.actions.Restart());
+            this.primary = Button(p + new Vector2(0f, 182f), 166f, 28f, "继续队列",
+                () => this.actions.Primary());
+            this.skip = Button(p + new Vector2(174f, 182f), 166f, 28f, "停止这只，去下一个",
+                () => this.actions.Skip());
+            this.stop = Button(p + new Vector2(0f, 214f), 166f, 28f, "停止整队",
+                () => this.actions.Stop());
+            this.restart = Button(p + new Vector2(174f, 214f), 166f, 28f, "重新开始",
+                () => this.actions.Restart());
+            this.setupDone = true;
+        }
+        catch (Exception ex)
+        {
+            // v1.2.10：KTK 带纹理组件在国服环境可能构造失败；吞掉并保持 setupDone=false，
+            // Apply 逐帧跳过，绝不让异常冒泡到 Tick 把整个原生 UI 停用。
+            this.setupDone = false;
+            try { Logger?.Invoke("[原生UI] 触发悬浮窗节点初始化失败，本窗暂不刷新：" + ex.Message); }
+            catch { /* 日志本身失败也不影响 */ }
+        }
     }
 
     private TextNode Text(Vector2 pos, float w, float h, uint fontSize, string value)
@@ -475,6 +523,10 @@ internal sealed class HudWindow : NativeAddon
 
     internal void Apply(HudSnapshot s)
     {
+        // v1.2.10 急救：节点尚未 OnSetup / 已被 OnFinalize 释放时跳过本帧，下一帧重试。
+        // 绝不让 null 按钮流到 NativeButtonStyle.Apply 触发 NRE。
+        if (!this.setupDone || this.primary is null || this.skip is null ||
+            this.stop is null || this.restart is null) return;
         if (this.badge is not null) this.badge.String = s.Badge;
         if (this.progress is not null) this.progress.String = s.Progress;
         if (this.job is not null) this.job.String = s.Job;
@@ -516,5 +568,6 @@ internal sealed class HudWindow : NativeAddon
         // 节点由 KTK 统一管理，这里只清托管引用，避免悬空指针。
         this.badge = this.progress = this.job = this.map = this.next = this.status = this.hint = null;
         this.primary = this.skip = this.stop = this.restart = null;
+        this.setupDone = false;   // v1.2.10：节点已释放，下一帧 Apply 必须等重新 OnSetup
     }
 }
