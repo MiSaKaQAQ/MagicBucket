@@ -3607,11 +3607,11 @@ public sealed partial class Plugin : IDalamudPlugin
             this.Print("正在从熊站拉取最新击杀时间和实时排点…");
         },
         OpenAuto = () => this.autoRunOpen = !this.autoRunOpen,
-        Legacy = () => this.legacyMainOpen = true,
-        // v1.1.98：齿轮 → 旧 ImGui 面板降级为「高级设置」。wantMain 不含 settingsOpen，
-        // 所以原生主窗不会被关掉，两个窗口并存，保存后原生界面立即反映新配置。
-        OpenSettings = () => { this.settingsOpen = !this.settingsOpen; this.legacyMainOpen = false; },
-        Mini = () => this.miniMode = true,
+        // v1.2.6 核弹级清扫：以下三个回调原本用来唤醒旧版 ImGui（完整版主窗 / 高级设置窗 / 收起小窗），
+        // 现在原生 KTK 已是唯一主力 UI，这些旧 GUI 入口全部封死，回调置空，绝不唤起任何 ImGui 窗口。
+        Legacy = () => { },
+        OpenSettings = () => { },
+        Mini = () => { },
         StopAll = () => this.StopAll(),
         AllWorlds = () =>
         {
@@ -4290,6 +4290,12 @@ public sealed partial class Plugin : IDalamudPlugin
 
     private void DrawMainWindow()
     {
+        // v1.2.6 核弹级清扫：原生 KTK 主窗（MainWindow）/ 自动前往（AutoWindow）/ 触发（HudWindow）已成
+        // 唯一主力 UI。旧版 ImGui 主窗 / 收起小窗（miniMode）/ 设置窗（settingsOpen）/ 完整版（legacyMainOpen）
+        // 全部封死，绝不再绘制任何 ImGui 根窗口，从根本上杜绝「点按钮弹出旧 GUI / 串台」。
+        // 本方法仅保留与渲染无关的副作用：筛选变更落盘（切大区 / 重载后原样恢复）。
+        this.TrackFilterChanges();
+        return;
         if (this.miniMode)
         {
             if (!this.themeLoaded) { this.themeLoaded = true; this.LoadTheme(); }
@@ -4418,6 +4424,7 @@ public sealed partial class Plugin : IDalamudPlugin
     /// <summary>主窗收起后留的那个方形小窗：图标铺满，单击展开，拖动挪位置。</summary>
     private void DrawMiniWindow()
     {
+        return; // v1.2.6：旧版 ImGui 收起小窗已彻底废弃，本方法不可达，直接返回，永不绘制。
         const float S = 104f;
         if (this.miniPos is not { } p0)
         {
