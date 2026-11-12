@@ -2,12 +2,12 @@
   {
     "Name": "魔法水桶",
     "InternalName": "SrankFlag",
-    "AssemblyVersion": "1.2.11.0",
-    "Description": "四大区 S 怪开闸/窗口实时监控，按服筛选、绿点点位、2.0~7.0 版本过滤；点一下自动跨服传送、开图插旗、按最近邻走完所有绿点。附带触发要点与触发准备（切职业套装 / 召唤宠物 / 丢弃物品）。",
+    "AssemblyVersion": "1.2.12.0",
+    "Description": "四大区 S 怪开闸/窗口实时监控，按服筛选、绿点点位、2.0~7.0 版本过滤；点一下自动跨服传送、开图插旗、按最近邻走完所有绿点。附带触发要点与触发准备（切职业套装 / 召唤宠物 / 丢弃物品）。v1.2.12 新增：Sonar 聊天栏实时击杀监听、S 怪历史记录窗口、已被他人触发的 S 自动拉黑并跳过。",
     "RepoUrl": "https://github.com/MiSaKaQAQ/MagicBucket",
-    "DownloadLinkInstall": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.11/SrankFlag.zip",
-    "DownloadLinkUpdate": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.11/SrankFlag.zip",
-    "DownloadLinkTesting": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.11/SrankFlag.zip",
+    "DownloadLinkInstall": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.12/SrankFlag.zip",
+    "DownloadLinkUpdate": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.12/SrankFlag.zip",
+    "DownloadLinkTesting": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.12/SrankFlag.zip",
     "ApplicableVersion": "any",
     "Tags": [
       "srank",
@@ -15,6 +15,7 @@
       "flag"
     ],
     "DalamudApiLevel": 15,
-    "Punchline": "S 怪速查：可触发监控 + 一键开图插旗寻路。"
+    "Punchline": "S 怪速查：可触发监控 + 一键开图插旗寻路。",
+    "Changelog": "v1.2.12：① 接入 Sonar 聊天栏实时击杀播报（三条互斥严格正则，只增不减，出生播报不影响概率）；② 新增 S 怪历史记录窗口（时间/怪名/服务器/事件/来源，主站+Sonar 双源，最多 500 条）；③ 「已被他人触发」改按窗口三段判定：冷却段有记录→锁，闸内→放行，闸走完仍无击杀→判定已触发未死并锁，只有击杀或 Sonar 脱战/重置才解除；主窗红标 [已触发]、按钮置灰 [已被抢触]、自动前往三重跳过。新增 /水桶 trigger scan 演练。升级后请 /xlplugins 重载。"
   }
 ]
