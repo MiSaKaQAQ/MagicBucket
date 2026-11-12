@@ -164,9 +164,9 @@ public sealed partial class Plugin
 
     private void AutoStart()
     {
-        // v1.2.7：点「开始自动前往 / 执行触发」立即开启窗口保护，整段触发会话里
-        // 过图隐藏 addon 不会再把主窗 / 触发悬浮窗 / 自动前往窗的开关写成 false。
-        this.GuardNativeWindows(TimeSpan.FromMinutes(10));
+        // v1.2.8 强锁：点「开始自动前往」立即上锁，整段触发会话（含暂停 / 继续 / 跳过）
+        // 窗口一律常驻；只有 AutoStop / AutoFinish / 手动停止才解锁。
+        this.EnterAutoLock("开始自动前往");
         var wasRunning = this.autoRunning;
         this.autoRunning = false;   // 重复点「开始」时先把上一轮的监控链作废，避免两条链同时往队列里走
         this.autoToken++;
@@ -176,6 +176,7 @@ public sealed partial class Plugin
         if (wasRunning) { try { this.StopAll(true); } catch { } }   // 顺手把上一轮的寻路/传送也取消掉
         if (this.srankData?.data is not { } data)
         {
+            this.ReleaseAutoLock("开始失败：数据未就绪");
             this.Print("[自动前往] 数据还没加载好，稍后再试");
             return;
         }
@@ -187,6 +188,7 @@ public sealed partial class Plugin
             : allWorlds.Where(w => this.autoWorlds.Contains(w)).ToList();
         if (hunts.Count == 0 || worlds.Count == 0)
         {
+            this.ReleaseAutoLock("开始失败：未勾选服务器或 S");
             this.Print("[自动前往] 请至少勾选一个服务器和一只 S");
             return;
         }
@@ -248,6 +250,7 @@ public sealed partial class Plugin
 
         if (this.autoQueue.Count == 0)
         {
+            this.ReleaseAutoLock("开始失败：没有可去的 S");
             this.Print("[自动前往] 勾选的 S 一个都去不了：");
             this.PrintSkipReport(true);
             this.autoStatus = "没有可去的 S（原因见聊天框）";
@@ -855,6 +858,7 @@ public sealed partial class Plugin
     private void AutoResume()
     {
         if (this.autoRunning || this.autoQueue.Count <= this.autoIdx) return;
+        this.EnterAutoLock("继续队列");
         this.autoPaused = false;
         this.autoPauseReason = "";
         this.autoRunning = true;
@@ -870,6 +874,7 @@ public sealed partial class Plugin
     /// <summary>「停止这只，去下一个」：立刻掐掉当前 S 的所有动作，记一笔手动跳过，接着跑下一个 S。</summary>
     private void AutoSkipCurrent()
     {
+        this.EnterAutoLock("跳过当前，继续队列");
         var job = this.autoJob;
         if (job is null)
         {
@@ -893,6 +898,7 @@ public sealed partial class Plugin
     /// <summary>整队停止：和「暂停」不同，这个是玩家主动收工，队列不再继续。</summary>
     private void AutoStop()
     {
+        this.ReleaseAutoLock("自动前往整队停止");
         this.autoRunning = false;
         this.autoPaused = false;
         this.autoPauseReason = "";
@@ -917,6 +923,7 @@ public sealed partial class Plugin
 
     private void AutoFinish()
     {
+        this.ReleaseAutoLock("自动前往全部走完");
         this.autoRunning = false;
         this.autoPaused = false;
         this.autoPauseReason = "";
@@ -954,8 +961,8 @@ public sealed partial class Plugin
         Skip = () => this.AutoSkipCurrent(),
         Stop = () => this.AutoStop(),
         Restart = () => this.AutoStart(),
-        // v1.2.7：过图 hide 不算关窗（详见 Plugin.ShouldIgnoreNativeClose）
-        Closed = () => { if (!this.ShouldIgnoreNativeClose()) this.autoHudOpen = false; },
+        // v1.2.8 强锁：最顶层拦截，自动化会话中绝不把触发悬浮窗开关写死为 false。
+        Closed = () => { if (IsAutoRunning) return; this.autoHudOpen = false; },
     };
 
     private HudSnapshot BuildHudSnapshot()
@@ -1027,8 +1034,8 @@ public sealed partial class Plugin
             else if (this.autoRunning) this.AutoStop();
             else this.AutoStart();
         },
-        // v1.2.7：过图 hide 不算关窗（详见 Plugin.ShouldIgnoreNativeClose）
-        Closed = () => { if (!this.ShouldIgnoreNativeClose()) this.autoRunOpen = false; },
+        // v1.2.8 强锁：最顶层拦截，自动化会话中绝不把自动前往窗开关写死为 false。
+        Closed = () => { if (IsAutoRunning) return; this.autoRunOpen = false; },
     };
 
     private AutoWindowSnapshot BuildAutoWindowSnapshot()
