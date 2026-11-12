@@ -164,6 +164,9 @@ public sealed partial class Plugin
 
     private void AutoStart()
     {
+        // v1.2.7：点「开始自动前往 / 执行触发」立即开启窗口保护，整段触发会话里
+        // 过图隐藏 addon 不会再把主窗 / 触发悬浮窗 / 自动前往窗的开关写成 false。
+        this.GuardNativeWindows(TimeSpan.FromMinutes(10));
         var wasRunning = this.autoRunning;
         this.autoRunning = false;   // 重复点「开始」时先把上一轮的监控链作废，避免两条链同时往队列里走
         this.autoToken++;
@@ -951,7 +954,8 @@ public sealed partial class Plugin
         Skip = () => this.AutoSkipCurrent(),
         Stop = () => this.AutoStop(),
         Restart = () => this.AutoStart(),
-        Closed = () => this.autoHudOpen = false,
+        // v1.2.7：过图 hide 不算关窗（详见 Plugin.ShouldIgnoreNativeClose）
+        Closed = () => { if (!this.ShouldIgnoreNativeClose()) this.autoHudOpen = false; },
     };
 
     private HudSnapshot BuildHudSnapshot()
@@ -1023,7 +1027,8 @@ public sealed partial class Plugin
             else if (this.autoRunning) this.AutoStop();
             else this.AutoStart();
         },
-        Closed = () => this.autoRunOpen = false,
+        // v1.2.7：过图 hide 不算关窗（详见 Plugin.ShouldIgnoreNativeClose）
+        Closed = () => { if (!this.ShouldIgnoreNativeClose()) this.autoRunOpen = false; },
     };
 
     private AutoWindowSnapshot BuildAutoWindowSnapshot()
