@@ -279,13 +279,15 @@ internal sealed class NativeHudRuntime
     internal void SetSettingsWindowOpen(bool open) =>
         this.ForceOne(this.settingsWindow, open, "设置面板", () => { this.lastSettingsSyncUtc = DateTime.MinValue; });
 
-    /// <summary>落地恢复：只把快照里原本开着的窗口拉回来，原本关着的不动。</summary>
-    internal void RestoreAfterTeleport(bool main, bool hud, bool auto)
+    /// <summary>落地恢复：只把快照里原本开着的窗口拉回来，原本关着的不动。
+    /// v1.2.11：设置面板也纳入快照，四个窗口一律按用户原本的状态保持。</summary>
+    internal void RestoreAfterTeleport(bool main, bool hud, bool auto, bool settings)
     {
         if (this.disposed) return;
         if (main) this.SetMainWindowOpen(true);
         if (hud) this.SetHudWindowOpen(true);
         if (auto) this.SetAutoWindowOpen(true);
+        if (settings) this.SetSettingsWindowOpen(true);
     }
 
     private void ForceOne(NativeAddon? w, bool open, string name, Action resetThrottle)
