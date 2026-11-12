@@ -1136,14 +1136,8 @@ public sealed partial class Plugin
 
     /// <summary>「正在触发什么」小窗：当前服 / S / 触发方式 / 状态，以及暂停·继续·跳过·整队停止。
     /// 触发成功后队列只是暂停，玩家打完怪回来点「继续队列」就能接着跑。</summary>
-    private void DrawAutoHud()
-    {
-        // v1.1.71 试点：原生窗口接管时不再画 ImGui 版（其它 3 个窗口照旧）。
-        if (this.nativeHud is { Active: true }) return;
-        try { this.DrawAutoHudInner(); }
-        catch (Exception ex) { this.log.Error(ex, "[魔法水桶] 触发悬浮窗绘制异常"); }
-    }
-
+    // ImGui 版「触发中」悬浮窗已废弃：触发中 HUD 完全由原生 KTK 窗口（NativeHud）接管，
+    // 不再绘制任何 ImGui 兜底窗，避免与原生窗口串台重叠。下方 DrawAutoHudInner 入口已删除，永不被调用（不可达死代码）。
     private void DrawAutoHudInner()
     {
         // 独立窗口，样式栈必须自带一套（和自动前往主窗一样）
@@ -1224,14 +1218,8 @@ public sealed partial class Plugin
         finally { PopAutoStyle(); }
     }
 
-    private void DrawAutoWindow()
-    {
-        // v1.1.72：原生窗口接管时不再画 ImGui 版（触发中 HUD 由各自的 Active 判断）。
-        if (this.nativeHud is { ActiveAuto: true }) return;
-        try { this.DrawAutoWindowInner(); }
-        catch (Exception ex) { this.log.Error(ex, "[魔法水桶] 自动前往窗口绘制异常"); }
-    }
-
+    // ImGui 版「自动前往」窗已废弃：自动前往窗完全由原生 KTK 窗口（NativeAutoWindow）接管，
+    // 不再绘制任何 ImGui 兜底窗，避免与原生窗口串台重叠。下方 DrawAutoWindowInner 入口已删除，永不被调用（不可达死代码）。
     private void DrawAutoWindowInner()
     {
         // 主窗口 End 之后才画这个窗，样式栈已弹出，这里必须自带一套主题色
