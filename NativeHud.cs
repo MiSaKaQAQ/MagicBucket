@@ -93,6 +93,13 @@ internal sealed class NativeHudRuntime
     internal bool ActiveMain => Enabled && EnabledMain && !this.failed && !this.mainFailed &&
                                 !this.disposed && this.mainWindow is not null;
 
+    /// <summary>KTK「自动前往」窗口不可用（KTK 初始化失败，或该窗口自身异常）→ 由 ImGui 版 DrawAutoWindow 兜底。
+    /// 仅在为 true 时才允许 Plugin.DrawMainWindow 画 ImGui 自动前往窗，避免与 KTK 原生窗口「串台」。</summary>
+    internal bool AutoFallback => this.failed || this.autoFailed;
+
+    /// <summary>KTK「触发中」HUD 不可用（KTK 初始化失败，或 HUD 自身异常）→ 由 ImGui 版 DrawAutoHud 兜底。</summary>
+    internal bool HudFallback => this.failed;
+
     /// <summary>KTK 初始化是否已经成功完成；失败时整体回退 ImGui。</summary>
     private bool InitReady()
     {
