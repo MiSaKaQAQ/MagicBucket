@@ -80,6 +80,7 @@ internal sealed class MainHuntRow
     internal string PointsHint = "";
     internal bool Expanded;
     internal bool HasSpecial;   // v1.2.2：是否有特殊触发脚本（切职/采集/自爆等），决定执行触发/自动前往文案
+    internal bool Triggered;    // v1.2.12：已被他人触发（行内红标 + 详情按钮置灰不可点）
     internal readonly List<MainPointRow> Points = new();
 }
 
@@ -135,6 +136,7 @@ internal sealed class MainActions
     internal Action<string> SelectDc = _ => { };
     internal Action<string> SelectPatch = _ => { };
     internal Action OpenSettings = () => { };   // v1.1.98：设置齿轮 → ImGui 高级设置
+    internal Action OpenHistory = () => { };    // v1.2.12：齿轮旁的 [历史] → 原生历史窗口
     internal Action<string, string> Primary = (_, _) => { };
     internal Action<string, string, float, float> GotoPoint = (_, _, _, _) => { };
     internal Action<string, string> GotoAetheryte = (_, _) => { };
@@ -217,6 +219,11 @@ internal sealed unsafe class MainWindow : NativeAddon
     private static readonly Vector4 CondOk = new(0.45f, 0.95f, 0.50f, 1f);
     private static readonly Vector4 CondBad = new(0.74f, 0.30f, 0.30f, 1f);
     private static readonly Vector4 CondNeutral = new(0.80f, 0.70f, 0.42f, 1f);
+    // v1.2.12：已被他人触发 —— 行内红标 + 详情动作按钮的置灰色
+    internal const string TrigBadgeText = "已触发";
+    private static readonly Vector4 TrigRed = new(0.95f, 0.33f, 0.30f, 1f);
+    private static readonly Vector4 ActBlocked = new(0.46f, 0.48f, 0.53f, 1f);
+    private const float BadgeW = 40f;
 
     // v1.1.91：进度条不再提供样式选择，固定「长方形无圆角 / 深槽 + 填充」一种风格。
     // v1.1.94：只用两个 ColorImageNode（空 Part + AddColor，不加载任何 .tex）。
@@ -334,6 +341,7 @@ internal sealed unsafe class MainWindow : NativeAddon
         internal ColorImageNode BarBg = null!;    // 血条深底（ColorImageNode 纯色，零纹理依赖）
         internal ColorImageNode BarFg = null!;    // 血条前景填充（按百分比缩放宽度）
         internal TextNode Tail = null!;           // 62%
+        internal TextNode Badge = null!;          // v1.2.12：红色「已触发」（只在被抢触时出现）
         internal int FillW;                       // 本帧整数填充宽度（供 Reflow 定位深槽起点）
     }
 
@@ -407,7 +415,7 @@ internal sealed unsafe class MainWindow : NativeAddon
     private ResNode? content;
 
     private TextInputNode? searchInput;
-    private TextButtonNode? bDc, bRefresh, bAuto, bLegacy, bMini, bStop, bClearSearch, bSettings;
+    private TextButtonNode? bDc, bRefresh, bAuto, bLegacy, bMini, bStop, bClearSearch, bSettings, bHistory;
     private TextButtonNode? bWorldMenu, bOnlyOpen;
     private TextButtonNode? bWorldAll, bWorldClear, bWorldCurrent;
     private readonly TextButtonNode?[] worldMenuItems = new TextButtonNode?[WorldMenuMax];
@@ -527,6 +535,9 @@ internal sealed unsafe class MainWindow : NativeAddon
             }));
         }
         catch { /* hover 变色失败不影响点击 */ }
+        // v1.2.12：齿轮左侧的 [历史] → 打开第 5 个原生窗口。与齿轮同一套 GhostButton 透明底样式，
+        // hover 由 NativeButtonStyle.InitHover 的 MouseOver/MouseOut 统一驱动，无需再手写事件。
+        this.bHistory = this.B(p, 60f, 26f, "历史", () => this.actions.OpenHistory());
         this.bAuto = this.B(p, 96f, 26f, "前往", () => this.actions.OpenAuto());
         this.bLegacy = this.B(p, 84f, 26f, "完整", () => this.actions.Legacy());
         this.bMini = this.B(p, 64f, 26f, "收起", () => this.actions.Mini());
@@ -720,6 +731,18 @@ internal sealed unsafe class MainWindow : NativeAddon
                     AlignmentType = AlignmentType.Right,
                     TextColor = ListText,
                 },
+                // v1.2.12：红色「已触发」。贴著怪名列右缘右对齐，最长怪名（先驱勇士 阿提卡斯 106.8px）
+                // 落在 146..252.8，徽标占 258..298，中间还留 5px，任何怪名都不会压到它。
+                Badge = new TextNode
+                {
+                    Position = p,
+                    Size = new Vector2(BadgeW, 20f),
+                    FontSize = 12,
+                    FontType = FontType.Axis,
+                    AlignmentType = AlignmentType.Right,
+                    TextColor = TrigRed,
+                    String = TrigBadgeText,
+                },
             };
             r.Icon.AttachNode(this.content);
             r.World.AttachNode(this.content);
@@ -727,9 +750,10 @@ internal sealed unsafe class MainWindow : NativeAddon
             r.BarBg.AttachNode(this.content);
             r.BarFg.AttachNode(this.content);
             r.Tail.AttachNode(this.content);
+            r.Badge.AttachNode(this.content);
             // 预建池默认隐藏，由 Apply 按数据打开，避免空行在首帧闪一下
             r.Hit.IsVisible = r.Icon.IsVisible = r.World.IsVisible = r.Name.IsVisible =
-                r.BarBg.IsVisible = r.BarFg.IsVisible = r.Tail.IsVisible = false;
+                r.BarBg.IsVisible = r.BarFg.IsVisible = r.Tail.IsVisible = r.Badge.IsVisible = false;
             this.rows.Add(r);
             this.rowKeys.Add("");
         }
@@ -1073,6 +1097,9 @@ internal sealed unsafe class MainWindow : NativeAddon
         NativeButtonStyle.FitText(this.counts!, s.Counts.Replace(" ", ""), 220f);
         NativeButtonStyle.HintTag(this.hintTag!, "右键详情", 100f, 18f);
         NativeButtonStyle.GhostButton(this.bSettings!, "设置", 24f, this.settingsHover);
+        // v1.2.10 铁律：Apply 必须有节点就绪守卫，关窗重开期间 bHistory 可能尚未 OnSetup。
+        if (this.bHistory is not null)
+            NativeButtonStyle.GhostButton(this.bHistory, "历史", 24f, false);
         NativeButtonStyle.FitText(this.status!, s.Status, CW);
         }
         catch (Exception ex)
@@ -1167,6 +1194,7 @@ internal sealed unsafe class MainWindow : NativeAddon
             ShowNode(rn.BarBg, vis);
             ShowNode(rn.BarFg, vis);
             ShowNode(rn.Tail, vis);
+            ShowNode(rn.Badge, vis && r is { Triggered: true });
             if (r is null) continue;
 
             var selected = string.Equals(r.Key, this.selectedKey, StringComparison.Ordinal);
@@ -1191,6 +1219,8 @@ internal sealed unsafe class MainWindow : NativeAddon
                 rn.FillW = this.PaintBar(rn.BarBg, rn.BarFg, BarW, BarH, prog0);
             }, r.En);
             RowStep("百分比", () => SetT(rn.Tail, r.Pct), r.En);
+            // v1.2.12：被抢触的行，怪名右侧挂一个红色「已触发」（文字在构造期已写好，这里只保色）
+            RowStep("已触发红标", () => rn.Badge.TextColor = TrigRed, r.En);
         }
 
         // ── 详情（v1.2.2：单行横向按钮 —— 目的地与操作 → [坐标] → [大水晶] → [执行触发/自动前往]）──
@@ -1223,8 +1253,13 @@ internal sealed unsafe class MainWindow : NativeAddon
                     actionItems.Add(("大水晶", AetIdle, AetHover,
                         (Action)(() => this.actions.FlagAetheryte(expanded.Map, expanded.Cn))));
                 // 执行触发（有脚本）/ 自动前往（纯寻路）：都走 MainPrimary，内部自动区分特殊触发与基础寻路
-                actionItems.Add((expanded.HasSpecial ? "执行触发" : "自动前往", ActIdle, ActHover,
-                    (Action)(() => this.actions.Primary(expanded.En, expanded.World))));
+                // v1.2.12：已被他人触发 → 灰字「已被抢触」，点了也只会提示、不会动身
+                // （MainPrimary 里还有最后一道拦截，防止从别的入口绕进来）。
+                actionItems.Add(expanded.Triggered
+                    ? ("已被抢触", ActBlocked, ActBlocked,
+                        (Action)(() => this.actions.Primary(expanded.En, expanded.World)))
+                    : (expanded.HasSpecial ? "执行触发" : "自动前往", ActIdle, ActHover,
+                        (Action)(() => this.actions.Primary(expanded.En, expanded.World))));
 
                                 // 先看本怪有没有特殊触发条件（天气/时间/月相）—— 有则条件标签钉最左，其余右移
                 var condInfo = HuntConditionHelper.GetCondition(expanded.En);
@@ -1340,6 +1375,9 @@ internal sealed unsafe class MainWindow : NativeAddon
         br.Position = At(CW - br.Width, fy);
         var gear = this.bSettings!;
         gear.Position = At(CW - br.Width - gear.Width - 6f, fy + 1f);
+        // v1.2.12：[历史] 紧贴齿轮左侧，右上顺序 → [历史] [设置] [刷新]
+        if (this.bHistory is { } hist)
+            hist.Position = At(CW - br.Width - gear.Width - hist.Width - 12f, fy + 1f);
         this.bDc!.IsVisible = false;
         // ★ 非豆豆柴大区：顶行右侧空白显示浅灰提示，数据源为公开熊站、只能手动刷新
         if (s.NeedsManualRefresh)
@@ -1503,6 +1541,7 @@ internal sealed unsafe class MainWindow : NativeAddon
                 ShowNode(rn.BarBg, false);
                 ShowNode(rn.BarFg, false);
                 ShowNode(rn.Tail, false);
+                ShowNode(rn.Badge, false);
                 continue;
             }
             ShowNode(rn.Hit, true);
@@ -1510,6 +1549,7 @@ internal sealed unsafe class MainWindow : NativeAddon
             ShowNode(rn.World, true);
             ShowNode(rn.Name, true);
             ShowNode(rn.Tail, true);
+            ShowNode(rn.Badge, s.Hunts[i].Triggered);
             // ★ v1.1.98：滚动区内所有行节点 Alpha 恒为 1，杜绝「越往下越淡」
             KeepOpaque(rn.Hit); KeepOpaque(rn.Icon); KeepOpaque(rn.World);
             KeepOpaque(rn.Name); KeepOpaque(rn.Tail);
@@ -1518,6 +1558,8 @@ internal sealed unsafe class MainWindow : NativeAddon
             rn.Icon.Position = At(IconX, ly + 3f);
             rn.World.Position = At(WorldX, ly + 4f);
             rn.Name.Position = At(NameX, ly + 4f);
+            rn.Badge.Position = At(NameX + NameW - BadgeW - 2f, ly + 4f);
+            KeepOpaque(rn.Badge);
             var by = ly + (RowH - BarH) / 2f;
             if (firstBarY < 0f) firstBarY = by;
 
