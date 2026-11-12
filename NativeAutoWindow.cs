@@ -537,6 +537,12 @@ internal sealed class AutoWindow : NativeAddon
     protected override unsafe void OnHide(AtkUnitBase* addon)
     {
         base.OnHide(addon);
+        // v1.2.8 强锁：会话中任何 hide 都不回写开关，下一帧 ForceReopenAll 强制复活。
+        if (Plugin.IsAutoRunning)
+        {
+            Plugin.NativeReopenMask |= 2;   // bit1 = 自动前往窗
+            return;
+        }
         // 用户点原生窗口的 X 时把开关同步回去；主动 Close() 时 autoRunOpen 本来就是 false。
         this.actions.Closed();
     }
