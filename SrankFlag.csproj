@@ -1,0 +1,45 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <AssemblyName>SrankFlag</AssemblyName>
+    <RootNamespace>SrankFlag</RootNamespace>
+  <Version>1.2.3.0</Version>
+  <AssemblyVersion>1.2.3.0</AssemblyVersion>
+  <FileVersion>1.2.3.0</FileVersion>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <!-- 清单 -->
+    <Name>魔法水桶</Name>
+    <Author>hunhuan</Author>
+    <Punchline>S 怪速查：可触发监控 + 一键开图插旗寻路。</Punchline>
+    <Description>四大区 S 怪开闸/窗口实时监控，按服筛选、绿点点位、2.0~7.0 版本过滤；点一下自动跨服传送、开图插旗、按最近邻走完所有绿点。附带触发要点与触发准备（切职业套装 / 召唤宠物 / 丢弃物品）。</Description>
+    <RepoUrl>https://github.com/MiSaKaQAQ/MagicBucket</RepoUrl>
+    <Tags>srank;hunt;flag</Tags>
+    <CategoryTags>utility</CategoryTags>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- 钉死到游戏实际注入的 Dalamud 版本（XIVLauncherCN 的 15.x），避免浮动引用导致运行时 MissingMethodException -->
+    <DalamudLibPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\addon\Hooks\26-11-06-02\</DalamudLibPath>
+    <!-- 关键：Dalamud SDK 在 Sdk.props 里已把默认路径（%APPDATA%\XIVLauncher\...\Hooks\dev，旧版 13.x）固化进
+         AssemblySearchPaths，只改 DalamudLibPath 无效。这里把它前置，保证引用解析到上面这个目录。 -->
+    <AssemblySearchPaths>$(DalamudLibPath);$(AssemblySearchPaths)</AssemblySearchPaths>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="srank_data.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="icon.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- v1.1.71 原生 HUD 试点：国服 DailyRoutines 随包的 KamiToolKit。
+       这两个 DLL 会随编译复制到 bin/Release，部署时也要一起放进插件目录。 -->
+  <ItemGroup>
+    <Reference Include="KamiToolKit">
+      <HintPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\installedPlugins\DailyRoutines\2.2.7.1\KamiToolKit.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="FFXIVClientStructs.Expansion">
+      <HintPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\installedPlugins\DailyRoutines\2.2.7.1\FFXIVClientStructs.Expansion.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
