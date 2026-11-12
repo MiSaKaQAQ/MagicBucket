@@ -43,9 +43,9 @@ internal sealed class HudActions
 }
 
 /// <summary>
-/// KTK 运行时桥（三个原生窗口共用一次 KTK 初始化）。生命周期：
+/// KTK 运行时桥（触发中 / 自动前往 / 主窗 / 设置面板四个原生窗口共用一次 KTK 初始化）。生命周期：
 ///   BeginInit（插件构造，异步启动 InitializeAsync）
-///   → Tick / TickAuto / TickMain（每帧，框架主线程）→ Shutdown。
+///   → Tick / TickAuto / TickMain / TickSettings（每帧，框架主线程）→ Shutdown。
 /// HUD 异常置 failed，自动前往置 autoFailed，主窗置 mainFailed，各自回退对应 ImGui 窗口。
 /// </summary>
 internal sealed class NativeHudRuntime
@@ -60,27 +60,34 @@ internal sealed class NativeHudRuntime
     private readonly HudActions actions;
     private readonly AutoWindowActions autoActions;
     private readonly MainActions mainActions;
+    private readonly SettingsActions settingsActions;
     private readonly Action<string> log;
     private Task? initTask;
     private HudWindow? window;
     private AutoWindow? autoWindow;
     private MainWindow? mainWindow;
+    private SettingsWindow? settingsWindow;
     private bool failed;
     private bool autoFailed;
     private bool mainFailed;
+    private bool settingsFailed;
     private bool disposed;
     private DateTime lastSyncUtc = DateTime.MinValue;
     private DateTime lastAutoSyncUtc = DateTime.MinValue;
     private DateTime lastMainSyncUtc = DateTime.MinValue;
+    private DateTime lastSettingsSyncUtc = DateTime.MinValue;
 
     internal NativeHudRuntime(HudActions actions, AutoWindowActions autoActions,
-                              MainActions mainActions, Action<string> log)
+                              MainActions mainActions, SettingsActions settingsActions,
+                              Action<string> log)
     {
         this.actions = actions;
         this.autoActions = autoActions;
         this.mainActions = mainActions;
+        this.settingsActions = settingsActions;
         this.log = log;
         MainWindow.Logger = log;   // 让主窗内部的异常/降级日志也进 /xllog
+        SettingsWindow.Logger = log;   // v1.2.7 设置面板同理
     }
 
     /// <summary>「触发中」原生 HUD 窗口已成功初始化并接管（旧版 ImGui 触发悬浮窗已彻底废弃，不再绘制）。</summary>
@@ -233,12 +240,71 @@ internal sealed class NativeHudRuntime
     /// <summary>v1.1.98：ImGui 高级设置保存后，跳过主窗 200ms 节流，下一帧立即 Apply。</summary>
     internal void ForceMainRefresh() => this.lastMainSyncUtc = DateTime.MinValue;
 
+    /// <summary>v1.2.7：原生设置面板。与主窗一样共用一次 KTK 初始化，独立 200ms 节流；
+    /// 点齿轮 / 切换开关后 ForceSettingsRefresh() 让下一帧立即重画。</summary>
+    internal void TickSettings(bool wantOpen, SettingsSnapshot s)
+    {
+        if (!Enabled || this.failed || this.settingsFailed || this.disposed) return;
+        try
+        {
+            if (this.settingsWindow is null)
+            {
+                if (!this.InitReady()) return;
+                this.settingsWindow = new SettingsWindow(this.settingsActions)
+                {
+                    InternalName = "MagicBucketNativeSettings",
+                    Title = "魔法水桶 · 设置",
+                    Size = new Vector2(SettingsWindow.W, SettingsWindow.H),
+                };
+                this.log("[原生UI] 设置面板原生窗口已就绪");
+            }
+
+            if (!wantOpen)
+            {
+                if (this.settingsWindow.IsOpen)
+                {
+                    this.settingsWindow.SuppressClosed = true;
+                    try { this.settingsWindow.Close(); }
+                    finally { this.settingsWindow.SuppressClosed = false; }
+                }
+                return;
+            }
+
+            if (!this.settingsWindow.IsOpen)
+            {
+                this.settingsWindow.Open();
+                this.lastSettingsSyncUtc = DateTime.MinValue;   // 刚打开必须立刻刷一次，别等节流
+            }
+            if ((DateTime.UtcNow - this.lastSettingsSyncUtc).TotalMilliseconds < 200) return;
+            this.lastSettingsSyncUtc = DateTime.UtcNow;
+            if (this.settingsWindow.IsOpen) this.settingsWindow.Apply(s);
+        }
+        catch (Exception ex)
+        {
+            this.settingsFailed = true;
+            this.log($"[原生UI] 设置面板异常，已停用（无 ImGui 兜底）：{ex}");
+            try { this.settingsWindow?.Close(); } catch { /* 忽略清理异常 */ }
+        }
+    }
+
+    /// <summary>v1.2.7：跳过设置面板 200ms 节流，下一帧立即重画。</summary>
+    internal void ForceSettingsRefresh() => this.lastSettingsSyncUtc = DateTime.MinValue;
+
     internal void Shutdown()
     {
         if (this.disposed) return;
         this.disposed = true;
         try { this.window?.Close(); } catch { /* 卸载时别拖垮游戏 */ }
         try { this.autoWindow?.Close(); } catch { /* 同上 */ }
+        try
+        {
+            if (this.settingsWindow is { } sw)
+            {
+                sw.SuppressClosed = true;
+                sw.Close();
+            }
+        }
+        catch { /* 同上 */ }
         try
         {
             if (this.mainWindow is { } mw)
@@ -251,6 +317,7 @@ internal sealed class NativeHudRuntime
         this.window = null;
         this.autoWindow = null;
         this.mainWindow = null;
+        this.settingsWindow = null;
         if (this.initTask is { IsCompletedSuccessfully: true })
         {
             try { KamiToolKitLibrary.Dispose(); }
