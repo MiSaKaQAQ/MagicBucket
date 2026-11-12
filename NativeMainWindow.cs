@@ -1665,6 +1665,12 @@ internal sealed unsafe class MainWindow : NativeAddon
     protected override unsafe void OnHide(AtkUnitBase* addon)
     {
         base.OnHide(addon);
+        // v1.2.8 强锁：会话中任何 hide 都不回写 mainWindowOpen，下一帧强制复活。
+        if (Plugin.IsAutoRunning)
+        {
+            Plugin.NativeReopenMask |= 4;   // bit2 = 主窗
+            return;
+        }
         if (!this.SuppressClosed) this.actions.Closed();
     }
 
