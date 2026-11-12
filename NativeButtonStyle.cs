@@ -270,6 +270,9 @@ internal static class NativeButtonStyle
     /// </summary>
     internal static float Apply(TextButtonNode b, string? label, float maxW, float baseH, bool selected)
     {
+        // v1.2.10 急救：KTK 节点可能在 Open()/OnSetup 之间尚未创建，或已被 OnFinalize 释放。
+        // 传 null 时直接跳过，绝不让一次 NRE 冒泡到 Tick* 把整个原生 UI 停用。
+        if (b is null) return 0f;
         label = Safe(label);
         if (maxW < MinW) maxW = MinW;
         var avail = MathF.Max(16f, maxW - PadX);
