@@ -76,6 +76,7 @@ internal sealed class NativeHudRuntime
     private DateTime lastAutoSyncUtc = DateTime.MinValue;
     private DateTime lastMainSyncUtc = DateTime.MinValue;
     private DateTime lastSettingsSyncUtc = DateTime.MinValue;
+    private DateTime lastKeepAliveUtc = DateTime.MinValue;   // v1.2.8 强锁低频保活
 
     internal NativeHudRuntime(HudActions actions, AutoWindowActions autoActions,
                               MainActions mainActions, SettingsActions settingsActions,
@@ -239,6 +240,48 @@ internal sealed class NativeHudRuntime
 
     /// <summary>v1.1.98：ImGui 高级设置保存后，跳过主窗 200ms 节流，下一帧立即 Apply。</summary>
     internal void ForceMainRefresh() => this.lastMainSyncUtc = DateTime.MinValue;
+
+    /// <summary>v1.2.8 强锁（强制复活第 2 层）：会话中只要任一窗口被游戏 OnHide 隐藏过，
+    /// 就在下一帧绕过 200ms 节流与 IsOpen 缓存，无条件重新 Open。
+    /// 过图时 KTK 的 IsOpen 可能仍为 true，光靠 Tick* 里「wantOpen 且窗口未打开」的判断不会重开，
+    /// 这正是 v1.2.7 即使拦住回写、窗口依旧消失的原因之一。</summary>
+    internal void ForceReopenAll(bool wantSettings)
+    {
+        if (!Plugin.IsAutoRunning || this.disposed || this.failed) return;
+
+        // 第 1 层：被 OnHide 隐藏过的窗口，绕过 IsOpen 缓存无条件重新 Open。
+        var mask = Plugin.NativeReopenMask;
+        if (mask != 0)
+        {
+            Plugin.NativeReopenMask = 0;
+            if ((mask & 1) != 0) this.ReopenOne(this.window, "触发悬浮窗");
+            if ((mask & 2) != 0) this.ReopenOne(this.autoWindow, "自动前往窗");
+            if ((mask & 4) != 0) this.ReopenOne(this.mainWindow, "主窗");
+            if ((mask & 8) != 0 && wantSettings) this.ReopenOne(this.settingsWindow, "设置面板");
+        }
+
+        // 第 2 层：每秒一次低频保活。覆盖「游戏直接改 addon 可见性、没回调 OnHide」，
+        // 以及本帧 Tick* 被前面的异常跳过的情况；只在 IsOpen=false 时 Open，不会重复建节点。
+        if ((DateTime.UtcNow - this.lastKeepAliveUtc).TotalSeconds < 1) return;
+        this.lastKeepAliveUtc = DateTime.UtcNow;
+        this.KeepAliveOne(this.window);
+        this.KeepAliveOne(this.autoWindow);
+        this.KeepAliveOne(this.mainWindow);
+    }
+
+    private void ReopenOne(NativeAddon? w, string name)
+    {
+        if (w is null) return;
+        try { w.Open(); }
+        catch (Exception ex) { this.log($"[原生UI] {name} 强制复活失败：{ex.Message}"); }
+    }
+
+    private void KeepAliveOne(NativeAddon? w)
+    {
+        if (w is null) return;
+        try { if (!w.IsOpen) w.Open(); }
+        catch { /* 保活失败不影响主流程 */ }
+    }
 
     /// <summary>v1.2.7：原生设置面板。与主窗一样共用一次 KTK 初始化，独立 200ms 节流；
     /// 点齿轮 / 切换开关后 ForceSettingsRefresh() 让下一帧立即重画。</summary>
@@ -427,6 +470,13 @@ internal sealed class HudWindow : NativeAddon
     protected override unsafe void OnHide(AtkUnitBase* addon)
     {
         base.OnHide(addon);
+        // v1.2.8 强锁：最顶层拦截。自动化会话中，游戏因过图 / 跨服隐藏 addon 时
+        // 绝不回写开关，只打一个「需要复活」标记，下一帧由 ForceReopenAll 无条件拉回来。
+        if (Plugin.IsAutoRunning)
+        {
+            Plugin.NativeReopenMask |= 1;   // bit0 = 触发悬浮窗
+            return;
+        }
         // 用户点原生窗口的 X / 游戏自行隐藏时，把开关同步回去。
         // 主动 Close() 也会走这里，但那时 autoHudOpen 本来就是 false，不会造成循环。
         this.actions.Closed();
