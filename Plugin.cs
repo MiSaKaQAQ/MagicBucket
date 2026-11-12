@@ -251,6 +251,12 @@ public sealed partial class Plugin : IDalamudPlugin
     private readonly IDalamudPluginInterface pi;   // Artisan IPC 用
     private readonly IUiBuilder uiBuilder;
     private NativeHudRuntime? nativeHud;          // v1.1.71/72/74：原生「触发中」+「自动前往」+「主窗」（失败各自回退 ImGui）
+    /// <summary>v1.2.12：S 怪历史记录（双源：主站 HTTP / Sonar 聊天栏）。独立 srank_history.json，
+    /// 绝不触碰 5 个用户状态文件。</summary>
+    private SrankHistory? history;
+    private bool historyWindowOpen;                // 原生历史窗口开关（第 5 个窗，纳入过图快照）
+    private HistoryFilter historyFilter = HistoryFilter.All;
+    private int historyPage;
     private bool legacyMainOpen;                  // v1.1.74：临时切回原 ImGui 完整版主窗
     private bool settingsOpen;                    // v1.1.98：齿轮打开 ImGui「高级设置」（默认 false）
     private string mainExpandedKey = "";          // v1.1.77：原生主窗当前展开的「服 × 怪」行 key
@@ -272,13 +278,16 @@ public sealed partial class Plugin : IDalamudPlugin
     private bool settingsWindowOpen;
     // ───────── v1.2.9：过图窗口快照（传送前记录 / 落地后延迟恢复，绝不强锁） ─────────
     private bool teleportSnapshotPending;
-    private bool teleportSnapshotMain, teleportSnapshotHud, teleportSnapshotAuto, teleportSnapshotSettings;
+    private bool teleportSnapshotMain, teleportSnapshotHud, teleportSnapshotAuto,
+                 teleportSnapshotSettings, teleportSnapshotHistory;   // v1.2.12：第 5 窗
     private DateTime teleportSnapshotAtUtc = DateTime.MinValue;
     private DateTime restoreAfterTeleportUtc = DateTime.MinValue;
     private bool wasBetweenAreas;
-    // v1.2.11：稳定态窗口寄存器。每帧在「非过图 + 已落地」时记录用户当前可见的 4 个窗口开关，
+    // v1.2.11：稳定态窗口寄存器。每帧在「非过图 + 已落地」时记录用户当前可见的窗口开关，
     // 作为传送快照的权威来源。游戏过图 hide addon 会把 bool 写成 false，直接拍快照会被污染。
-    private bool stableWindowMain, stableWindowHud, stableWindowAuto, stableWindowSettings;
+    // v1.2.12：历史窗口一并纳入，保持「原来开着几个窗就保持几个」。
+    private bool stableWindowMain, stableWindowHud, stableWindowAuto,
+                 stableWindowSettings, stableWindowHistory;
     private bool stableWindowValid;
     /// <summary>「停止」令牌：每次点停止 +1，之前排进队列的延时任务全部作废。</summary>
     private int runGen;
@@ -386,7 +395,12 @@ public sealed partial class Plugin : IDalamudPlugin
 
         var cmd = new CommandInfo(this.OnCommand)
         {
-            HelpMessage = "魔法水桶：/水桶 打开游戏内窗口 · /水桶 nav <地图> <X> <Y>（开图插旗+vnav寻路） · " +
+            HelpMessage = "魔法水桶：/水桶 打开游戏内窗口 · /水桶 history 打开 S 怪历史 · " +
+                          "/水桶 sonar [test|probe|clear] 实时击杀自检 · " +
+                          "/水桶 trigger 查看已被他人触发的 S · /水桶 trigger main on|off 主站源开关 · " +
+                          "/水桶 trigger stuck on|off 闸后未死判定 · /水桶 trigger scan 演练判定 · " +
+                          "/水桶 trigger clear 清空黑名单 · " +
+                          "/水桶 nav <地图> <X> <Y>（开图插旗+vnav寻路） · " +
                           "/水桶 goto <地图> <X> <Y> [服务器] [分线] · /水桶 discard · /水桶 weea · " +
                           "/水桶 stop（取消全部自动流程） · " +
                           "/水桶 summon [手动召唤随从] · /水桶 summonauto on|off · /水桶 leaveauto on|off",
@@ -394,6 +408,18 @@ public sealed partial class Plugin : IDalamudPlugin
         };
         this.commandManager.AddHandler(CommandName, cmd);
         try { this.commandManager.AddHandler(CommandAlias, cmd); } catch { /* 别名注册失败不影响主命令 */ }
+
+        // v1.2.12：历史库必须在任何数据源写入之前就绪（Sonar 事件 / 主站拉取都往这里推）。
+        try
+        {
+            this.history = new SrankHistory(this.pluginDirectory,
+                m => this.log.Info("[魔法水桶] " + m));
+        }
+        catch (Exception ex)
+        {
+            this.history = null;
+            try { this.log.Warning("[魔法水桶] 历史库初始化失败，历史功能停用：" + ex.Message); } catch { }
+        }
 
         this.LoadAutoSettings();   // v1.2.7：设置面板的三个自动化开关（新增独立文件，不动旧的 5 个用户状态文件）
         this.RefreshUnlockedMinions();
@@ -403,6 +429,8 @@ public sealed partial class Plugin : IDalamudPlugin
         this.clientState.Login += this.ClientState_OnLogin;
         this.uiBuilder.Draw += this.DrawMainWindow;
         try { this.chatGui.ChatMessage += this.OnChatMessage; } catch { /* 聊天钩子失败不影响主功能 */ }
+        // v1.2.12：Sonar 击杀播报独立监听（只认带 "was just killed" 的击杀，出生播报一律丢弃）
+        try { this.chatGui.ChatMessage += this.OnSonarKillChatMessage; } catch { /* 不影响主功能 */ }
 
         this.StartServer();
         this.InitNativeHud();
@@ -419,6 +447,7 @@ public sealed partial class Plugin : IDalamudPlugin
         this.uiBuilder.Draw -= this.DrawMainWindow;
         try { this.nativeHud?.Shutdown(); } catch { /* 原生 HUD 卸载失败不影响插件退出 */ }
         try { this.chatGui.ChatMessage -= this.OnChatMessage; } catch { }
+        try { this.chatGui.ChatMessage -= this.OnSonarKillChatMessage; } catch { }
         this.cts.Cancel();
         try { this.listener?.Stop(); } catch { /* ignore */ }
         this.listener = null;
@@ -446,6 +475,18 @@ public sealed partial class Plugin : IDalamudPlugin
         var sub = parts[0].ToLowerInvariant();
         switch (sub)
         {
+            case "history":           // v1.2.12：/水桶 history，打开 / 关闭原生历史窗口
+                this.historyWindowOpen = !this.historyWindowOpen;
+                this.ApplyHistoryWindowNow();
+                this.NoteUserWindowChange();
+                this.Print(this.historyWindowOpen ? "S 怪历史窗口已打开" : "S 怪历史窗口已关闭");
+                return;
+            case "sonar":             // v1.2.12：/水桶 sonar [test|probe|clear]，概率核对 + 链路自检
+                this.SonarCommand(parts.Length > 1 ? parts[1].ToLowerInvariant() : "");
+                return;
+            case "trigger":           // v1.2.12：/水桶 trigger [clear]，查看 / 清空「已被他人触发」黑名单
+                this.TriggerCommand(parts);
+                return;
             case "auto":
                 this.autoRunOpen = !this.autoRunOpen;
                 this.nativeHud?.SetAutoWindowOpen(this.autoRunOpen);
@@ -3584,6 +3625,10 @@ public sealed partial class Plugin : IDalamudPlugin
             // v1.2.6 封死所有 ImGui 窗口后那段成了死代码 → restartAt 永远是 0，
             // 维护分支不生效、概率用错 rt/mt。移到每帧调度里（60s 节流）。
             this.MaybeRefreshRestart(false);
+            // v1.2.12：自动前往途中若这只突然被拉黑（Sonar 播报/主站信号），立刻掐断寻路换下一只
+            this.TickTriggeredGuard();
+            // v1.2.12：黑名单窗口三段同步（冷却锁 / 闸内放行 / 闸后未死），闸会随时间自然换段
+            this.TickTriggeredSweep();
             this.TickNativeHud();
         }
         catch { /* 每帧跑，任何异常都吞掉 */ }
@@ -3610,6 +3655,18 @@ public sealed partial class Plugin : IDalamudPlugin
         catch (Exception ex) { try { this.log.Warning(ex, "[魔法水桶] 主窗状态同步失败"); } catch { } }
     }
 
+    /// <summary>v1.2.12：历史窗口同样走「只切一个 bool + 直驱 KTK」，不依赖 Draw / 节流 / IsOpen 缓存。</summary>
+    private void ApplyHistoryWindowNow()
+    {
+        try
+        {
+            this.nativeHud?.ReviveAfterError();
+            this.nativeHud?.SetHistoryWindowOpen(this.historyWindowOpen);
+            this.nativeHud?.ForceHistoryRefresh();
+        }
+        catch (Exception ex) { try { this.log.Warning(ex, "[魔法水桶] 历史窗口状态同步失败"); } catch { } }
+    }
+
     /// <summary>传送 / 跨服 / 执行触发前拍一张窗口开关快照。过图时窗口该关就关，
     /// 不强锁、不拦截 OnHide 回写；落地后按这份快照恢复。</summary>
     private void CaptureWindowStateBeforeTeleport()
@@ -3634,18 +3691,20 @@ public sealed partial class Plugin : IDalamudPlugin
         this.teleportSnapshotHud = this.stableWindowHud;
         this.teleportSnapshotAuto = this.stableWindowAuto;
         this.teleportSnapshotSettings = this.stableWindowSettings;
+        this.teleportSnapshotHistory = this.stableWindowHistory;   // v1.2.12：第 5 窗
         this.teleportSnapshotPending = true;
         this.teleportSnapshotAtUtc = DateTime.UtcNow;
         this.restoreAfterTeleportUtc = DateTime.MinValue;
     }
 
-    /// <summary>把用户当前可见的 4 个窗口开关记进稳定态寄存器。</summary>
+    /// <summary>把用户当前可见的 5 个窗口开关记进稳定态寄存器。</summary>
     private void RecordStableWindowState()
     {
         this.stableWindowMain = this.mainWindowOpen;
         this.stableWindowHud = this.autoHudOpen;
         this.stableWindowAuto = this.autoRunOpen;
         this.stableWindowSettings = this.settingsWindowOpen;
+        this.stableWindowHistory = this.historyWindowOpen;   // v1.2.12
         this.stableWindowValid = true;
     }
 
@@ -3657,6 +3716,7 @@ public sealed partial class Plugin : IDalamudPlugin
         this.teleportSnapshotHud = this.stableWindowHud;
         this.teleportSnapshotAuto = this.stableWindowAuto;
         this.teleportSnapshotSettings = this.stableWindowSettings;
+        this.teleportSnapshotHistory = this.stableWindowHistory;   // v1.2.12
     }
 
     /// <summary>用户主动开 / 关窗口：立刻把新意图记进寄存器与待恢复快照。
@@ -3724,11 +3784,12 @@ public sealed partial class Plugin : IDalamudPlugin
         this.restoreAfterTeleportUtc = DateTime.MinValue;
         this.teleportSnapshotPending = false;
 
-        // ① 先把 4 个开关写回快照值，让 Tick* 的 wantOpen 与命令的 toggle 保持一致；
+        // ① 先把 5 个开关写回快照值，让 Tick* 的 wantOpen 与命令的 toggle 保持一致；
         this.mainWindowOpen = this.teleportSnapshotMain;
         this.autoHudOpen = this.teleportSnapshotHud;
         this.autoRunOpen = this.teleportSnapshotAuto;
         this.settingsWindowOpen = this.teleportSnapshotSettings;
+        this.historyWindowOpen = this.teleportSnapshotHistory;   // v1.2.12
         this.RecordStableWindowState();
         // ② 再直接驱动原生 KTK：Close→Open 绕过 IsOpen 缓存；底层报错由 Runtime 捕获并释放重开。
         // 只复活快照里原本开着的窗口，原本关着的绝不点亮。
@@ -3736,7 +3797,7 @@ public sealed partial class Plugin : IDalamudPlugin
         {
             this.nativeHud?.RestoreAfterTeleport(this.teleportSnapshotMain,
                 this.teleportSnapshotHud, this.teleportSnapshotAuto,
-                this.teleportSnapshotSettings);
+                this.teleportSnapshotSettings, this.teleportSnapshotHistory);
         }
         catch (Exception ex)
         {
@@ -3755,6 +3816,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 this.BuildAutoWindowActions(),
                 this.BuildMainActions(),
                 this.BuildSettingsActions(),
+                this.BuildHistoryActions(),      // v1.2.12：第 5 个原生窗口
                 msg => this.log.Info("[魔法水桶] " + msg));
             this.nativeHud.BeginInit(this.pi);
         }
@@ -3799,6 +3861,12 @@ public sealed partial class Plugin : IDalamudPlugin
         catch (Exception ex)
         {
             try { this.log.Error(ex, "[魔法水桶] 设置面板原生同步异常，本帧跳过"); } catch { }
+        }
+        // v1.2.12：S 怪历史窗口（主窗 [历史] 按钮 / /水桶 history）。独立 200ms 节流。
+        try { h.TickHistory(this.historyWindowOpen, this.BuildHistorySnapshot()); }
+        catch (Exception ex)
+        {
+            try { this.log.Error(ex, "[魔法水桶] 历史窗口原生同步异常，本帧跳过"); } catch { }
         }
     }
 
@@ -3867,6 +3935,45 @@ public sealed partial class Plugin : IDalamudPlugin
         LightTheme = this.lightMode,
         Status = this.restartAt > 0 ? $"维护 T 已同步 · {this.currentDc}" : $"当前大区 · {this.currentDc}",
     };
+
+    // ───────────── v1.2.12 原生历史窗口：数据 / 委托桥 ─────────────
+    private HistoryActions BuildHistoryActions() => new HistoryActions
+    {
+        SetFilter = f =>
+        {
+            this.historyFilter = f;
+            this.historyPage = 0;                 // 换筛选一定回第一页
+            this.nativeHud?.ForceHistoryRefresh();
+        },
+        PageBy = delta =>
+        {
+            this.historyPage = Math.Max(0, this.historyPage + delta);
+            this.nativeHud?.ForceHistoryRefresh();
+        },
+        Clear = () =>
+        {
+            this.history?.Clear();
+            this.historyPage = 0;
+            this.nativeHud?.ForceHistoryRefresh();
+            this.Print("已清空 S 怪历史记录（srank_history.json）");
+        },
+        Closed = () =>
+        {
+            this.historyWindowOpen = false;
+            this.nativeHud?.SetHistoryWindowOpen(false);
+            this.NoteUserWindowChange();   // v1.2.11：用户主动关窗要同步进快照
+        },
+    };
+
+    private HistorySnapshot BuildHistorySnapshot()
+    {
+        var s = this.history is { } h
+            ? h.Snapshot(this.historyFilter, this.historyPage)
+            : new HistorySnapshot { Status = "历史库未就绪" };
+        // Snapshot 会把越界页夹回最后一页；写回字段，避免反复点「下一页」让页码无限增大。
+        if (s.Page != this.historyPage) this.historyPage = s.Page;
+        return s;
+    }
 
     private sealed class AutoSettings
     {
@@ -3940,6 +4047,13 @@ public sealed partial class Plugin : IDalamudPlugin
         {
             this.settingsWindowOpen = !this.settingsWindowOpen;
             this.nativeHud?.ForceSettingsRefresh();
+        },
+        // v1.2.12：主窗齿轮旁的 [历史] 按钮 → 打开第 5 个原生窗口，绝不唤起任何 ImGui 窗口。
+        OpenHistory = () =>
+        {
+            this.historyWindowOpen = !this.historyWindowOpen;
+            this.ApplyHistoryWindowNow();
+            this.NoteUserWindowChange();
         },
         Mini = () => { },
         StopAll = () => this.StopAll(),
@@ -4104,6 +4218,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 BestWorld = world,
                 RowLabel = h.cn,
                 HasSpecial = HuntPreps.ContainsKey(h.cn),   // v1.2.2：该怪是否有特殊触发脚本（切职/采集/自爆等）
+                Triggered = this.IsTriggered(h.en, world),  // v1.2.12：已被他人触发 → 行内红标 + 按钮置灰
                 ProgressLabel = Dots(pct, st) + "  " + (st == "unknown" ? "—" : Math.Round(pct) + "%"),
                 PctValue = pct,
                 Clock = st == "cd" ? ClockText(eta) : st == "open" ? "00:00" : "--:--",
@@ -4171,11 +4286,21 @@ public sealed partial class Plugin : IDalamudPlugin
     /// <summary>主按钮 / 特殊目的地：复刻原 ImGui 展开行里的前往绿点 / 大水晶 / 丢弃 / 顾尼图逻辑。</summary>
     private void MainPrimary(string en, string world)
     {
-        this.CaptureWindowStateBeforeTeleport();
         var data = this.srankData?.data;
         if (data is null) return;
         var h = data.hunts.FirstOrDefault(x => x.en == en);
         if (h is null) return;
+
+        // v1.2.12：已被他人触发的一律不许再动 —— UI 上按钮是灰的，这里是最后一道闸，
+        // 防止从悬浮窗 / 旧状态 / 快捷键等旁路绕进来还能把人送过去。
+        if (this.IsTriggered(en, world))
+        {
+            this.Print($"[{h.cn}] 已被他人触发（{world}），不再前往。击杀播报或主站击杀时间到了才会解锁。");
+            this.nativeHud?.ForceMainRefresh();
+            return;
+        }
+
+        this.CaptureWindowStateBeforeTeleport();
         var pw = world;
 
         var greens = this.GreensFor(h, pw);
@@ -5247,6 +5372,11 @@ public sealed partial class Plugin : IDalamudPlugin
                 this.ApplyFilter(this.currentDc, d);
             }
             this.MergeBearCache();
+            this.ApplySonarKills();   // v1.2.12：本地实时击杀时间最后回放，保证比 HTTP/缓存更晚的值不被回滚
+            // v1.2.12「已被触发」：先读黑名单，再用磁盘里的死亡时间清掉「离线期间已被打死」的条目。
+            // 这是唯一的批量解锁路径，没有任何超时逻辑。
+            this.LoadTriggered();
+            this.SweepTriggeredByDeath();
         }
         catch (Exception ex)
         {
@@ -5531,6 +5661,10 @@ public sealed partial class Plugin : IDalamudPlugin
         _ = Task.Run(async () =>
         {
             var bag = new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
+            // v1.2.12：主站「这只怪现在活着/被触发」的可选信号（接口给了才有），与击杀时间分开收集
+            var trigBag = new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
+            // 负信号（接口明确说「没在打」）→ 立刻解除拉黑
+            var negBag = new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
 
             // 首选：站点 /api/live?dc= 一次拿回本大区全服 × 全怪的击杀时间（后台 5 分钟刷一次，比逐条快两个数量级）
             if (dc.Length > 0)
@@ -5543,6 +5677,9 @@ public sealed partial class Plugin : IDalamudPlugin
                     {
                         var txt = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                         using var doc = JsonDocument.Parse(txt);
+                        // v1.2.12：「已被触发」主站源。线上接口目前只有击杀时间，这里解析的是
+                        // triggered / engaged / spawned / relay 这类可选容器；没有就静默跳过。
+                        CollectTriggeredJson(doc.RootElement, trigBag, negBag);
                         if (doc.RootElement.TryGetProperty("live", out var lv) && lv.ValueKind == JsonValueKind.Object)
                         {
                             foreach (var w in lv.EnumerateObject())
@@ -5599,7 +5736,7 @@ public sealed partial class Plugin : IDalamudPlugin
 
             this.framework.RunOnTick(() =>
             {
-                try { this.ApplyBearResult(bag); }
+                try { this.ApplyBearResult(bag, trigBag, negBag); }
                 catch (Exception ex) { this.log.Warning("[SrankFlag] 熊站数据写入失败：" + ex.Message); }
                 this.bearFetching = false;
             });
@@ -5833,11 +5970,16 @@ public sealed partial class Plugin : IDalamudPlugin
         catch (Exception ex) { this.log.Warning("[SrankFlag] 读缓存失败：" + ex.Message); }
     }
 
-    private void ApplyBearResult(System.Collections.Concurrent.ConcurrentDictionary<string, double> map)
+    private void ApplyBearResult(System.Collections.Concurrent.ConcurrentDictionary<string, double> map,
+                                 System.Collections.Concurrent.ConcurrentDictionary<string, double>? triggered = null,
+                                 System.Collections.Concurrent.ConcurrentDictionary<string, double>? negative = null)
     {
         if (this.srankData?.data is not { } d) return;
         var hit = 0;
         var changed = 0;
+        // 本轮刚被主站确认「死了」的组合：接下来落主站拉黑信号时必须跳过，
+        // 否则「刚死解锁 → 同一轮又被 live 锁上」，永远等不到冷却结束。
+        var justDied = new HashSet<string>(StringComparer.Ordinal);
         foreach (var h in d.hunts)
         {
             if (h.worlds.Length == 0) continue;
@@ -5850,6 +5992,14 @@ public sealed partial class Plugin : IDalamudPlugin
                 {
                     wd.lastDeath = ts;
                     touched = true;
+                    // v1.2.12 历史：主站报了更晚的击杀时间 → 记一条 Kill/MainSite。
+                    // EventTime 用站点给的 ts（真实击杀时刻），不是本地 now；
+                    // 与 Sonar 那条不去重（Source 不同），正好用来核对站点延迟与概率。
+                    this.history?.Add(h.cn, wd.world, h.map,
+                        HistoryEventType.Kill, HistorySource.MainSite, ts);
+                    // v1.2.12：主站确认这只已经死了 → 解除「已被触发」黑名单（并把这次击杀记为已消化）
+                    this.ClearTriggered(h.en, wd.world, "主站击杀时间更新", ts);
+                    justDied.Add(TrigKey(h.en, wd.world));
                 }
             }
             if (touched)
@@ -5865,6 +6015,54 @@ public sealed partial class Plugin : IDalamudPlugin
         this.bearStatus = hit == 0
             ? $"拉取失败 · {DateTime.Now:HH:mm}"
             : $"已同步 {changed} 只 · {DateTime.Now:HH:mm}";
+
+        // v1.2.12 历史：主站数据更新后再检测一次「新进闸」→ Spawn/MainSite。
+        this.NoteMainSiteOpenStates(d);
+
+        // v1.2.12「已被触发」：三段状态机。
+        // 顺序很重要：先按最新的 lastDeath 解锁 → 再落主站接口给的明确信号/否认 → 最后按窗口分段
+        // 统一处理（冷却锁 / 闸内放行 / 闸后未死）。窗口判断放最后，才不会和刚写入的 lastDeath 打架。
+        this.SweepTriggeredByDeath();
+        this.ApplyMainSiteTriggered(triggered, negative, justDied);
+        this.SweepTriggeredWindow();
+
+        this.nativeHud?.ForceHistoryRefresh();
+    }
+
+    /// <summary>
+    /// v1.2.12：主站「新的 isOpen 状态」→ 一条出生 / 进闸历史（Source=MainSite）。
+    /// 判定口径与 BuildMainSnapshot 逐字一致（维护 T 主导时用 mt，否则用 rt），
+    /// 这样历史窗口里的「出生」和主界面显示的「开闸」永远对得上。
+    /// 只遍历当前大区 d.hunts（与自动前往一致，不跨大区）；首次见到的键只记基线不写历史，
+    /// 否则插件一启动就会把当前所有开闸怪刷成几百条。
+    /// MergeBearCache / ApplySonarKills 属于本地缓存回放，不推历史，避免每次重载重复记录。
+    /// </summary>
+    private void NoteMainSiteOpenStates(SnapshotData d)
+    {
+        if (this.history is null) return;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        try
+        {
+            foreach (var h in d.hunts)
+            {
+                foreach (var w in h.worlds)
+                {
+                    if (w.lastDeath <= 0) continue;
+                    var eff = Math.Max(w.lastDeath, this.restartAt);
+                    var maint = this.restartAt > 0 && this.restartAt > w.lastDeath;
+                    var useCd = maint && h.mt.Length >= 1 ? h.mt[0] : h.cd;
+                    var useWin = maint && h.mt.Length >= 2 ? h.mt[1] : h.win;
+                    var st = Calc(eff, now, useCd, useWin).State;
+                    var openAt = eff + (useCd > 0 ? useCd : CdHours) * 3600;
+                    this.history.NoteOpenState(this.currentDc + "|" + h.en + "|" + w.world,
+                        st == "open", h.cn, w.world, h.map, openAt);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            try { this.log.Warning("[SrankFlag.History] 主站进闸记录失败：" + ex.Message); } catch { }
+        }
     }
 
     /// <summary>按怪自己的冷却算状态：进闸 openAt = lastDeath + cd*3600，强制 forceAt = openAt + win*3600。
