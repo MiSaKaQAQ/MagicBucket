@@ -178,6 +178,15 @@ public sealed partial class Plugin : IDalamudPlugin
         public WorldDeath[] worlds { get; set; } = [];
     }
 
+    /// <summary>v1.2.7：站点 mt 表绝大多数等于 0.6×rt，只有这两只例外（Minhocao 窗口 4.8h、
+    /// Zona Seeker 窗口 3.6h）。老用户插件目录里的 srank_data.json 是用户状态文件，部署时不能覆盖，
+    /// 所以运行时按 en 补齐 mt；新装的包里已带完整 mt 字段，这里会直接跳过。</summary>
+    private static readonly Dictionary<string, double[]> MaintPairOverride = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Minhocao"] = new[] { 34.2, 4.8 },       // rt = [57, 6]
+        ["Zona Seeker"] = new[] { 34.2, 3.6 },    // rt = [57, 8]
+    };
+
     private sealed class WorldDeath
     {
         public string world { get; set; } = "";
@@ -259,6 +268,11 @@ public sealed partial class Plugin : IDalamudPlugin
     private DateTime lastReturnClick;
     private bool returnClickLogged;
     private bool mainWindowOpen = true;
+    /// <summary>v1.2.7：原生 KTK 设置面板开关（主窗齿轮切换）。</summary>
+    private bool settingsWindowOpen;
+    /// <summary>v1.2.7：窗口隐藏保护截止时刻。触发 / 传送期间游戏会临时 hide 所有自定义 addon，
+    /// 保护期内的 OnHide 一律不算「用户主动关窗」。</summary>
+    private DateTime nativeHideGuardUntil = DateTime.MinValue;
     /// <summary>「停止」令牌：每次点停止 +1，之前排进队列的延时任务全部作废。</summary>
     private int runGen;
     /// <summary>硬停止开关：停止后连「已经排到框架线程上、还没来得及发」的命令也一并拦掉。
@@ -374,6 +388,7 @@ public sealed partial class Plugin : IDalamudPlugin
         this.commandManager.AddHandler(CommandName, cmd);
         try { this.commandManager.AddHandler(CommandAlias, cmd); } catch { /* 别名注册失败不影响主命令 */ }
 
+        this.LoadAutoSettings();   // v1.2.7：设置面板的三个自动化开关（新增独立文件，不动旧的 5 个用户状态文件）
         this.RefreshUnlockedMinions();
         this.LoadSrankData();
         this.lastBearFetch = DateTime.UtcNow - BearInterval; // 启动后第一次 Update 就拉
@@ -490,15 +505,18 @@ public sealed partial class Plugin : IDalamudPlugin
             case "summonauto":
                 if (parts.Length >= 2) this.autoSummonMinion = ParseOn(parts[1]);
                 if (this.autoSummonMinion) this.RefreshUnlockedMinions();
+                this.SaveAutoSettings();
                 this.Print($"自动召唤随从：{(this.autoSummonMinion ? "已开启" : "已关闭")}");
                 return;
             case "leaveauto":
                 if (parts.Length >= 2) this.autoLeaveDuty = ParseOn(parts[1]);
+                this.SaveAutoSettings();
                 this.Print($"独身自动退本：{(this.autoLeaveDuty ? "已开启" : "已关闭")}");
                 return;
             case "倒地":
             case "return":
                 if (parts.Length >= 2) this.autoConfirmReturn = ParseOn(parts[1]);
+                this.SaveAutoSettings();
                 this.Print($"倒地自动点「确定」返回：{(this.autoConfirmReturn ? "已开启" : "已关闭")}" +
                            (this.autoConfirmReturn ? "（副本里想躺平等复活就先关掉）" : ""));
                 return;
@@ -627,6 +645,9 @@ public sealed partial class Plugin : IDalamudPlugin
     private GotoResult Goto(string map, float x, float y, string world, int line,
         string huntCn = "", bool nav = false, List<Pt>? route = null)
     {
+        // v1.2.7：跨服 / 传送会触发过图，游戏临时隐藏所有自定义 addon；开启窗口保护，
+        // 免得落地后主窗 / 触发悬浮窗 / 自动前往窗全部消失。
+        this.GuardNativeWindows(TimeSpan.FromMinutes(3));
         this.Resume();          // 上一次点过停止也没关系，这是一次新的动作
         var fr = this.Flag(map, x, y);
         if (!fr.Ok) return new GotoResult(false, fr.Message);
@@ -2635,6 +2656,8 @@ public sealed partial class Plugin : IDalamudPlugin
     /// 给没有触发点数据的 S（俄菲翁尼厄斯、戾虫那几只）兜底用。</summary>
     private GotoResult GotoAetheryte(string map, string world, string huntCn = "")
     {
+        // v1.2.7：同上，传大水晶同样是过图动作，窗口开关要保护起来
+        this.GuardNativeWindows(TimeSpan.FromMinutes(3));
         this.Resume();
         var ae = this.NearestAetheryte(map, 0f, 0f, huntCn);
         var needTravel = !string.IsNullOrWhiteSpace(world) &&
@@ -3531,9 +3554,39 @@ public sealed partial class Plugin : IDalamudPlugin
             this.TryAutoConfirmReturn();
             this.MaybeStartBearFetch(false);
             this.MaybeStartPointsFetch(false);
+            // v1.2.7：全局重启时间 T 的刷新原先只写在 ImGui 的 DrawHuntList 里，
+            // v1.2.6 封死所有 ImGui 窗口后那段成了死代码 → restartAt 永远是 0，
+            // 维护分支不生效、概率用错 rt/mt。移到每帧调度里（60s 节流）。
+            this.MaybeRefreshRestart(false);
             this.TickNativeHud();
         }
         catch { /* 每帧跑，任何异常都吞掉 */ }
+    }
+
+    // ───────────── v1.2.7：过图隐藏 addon 的窗口保护 ─────────────
+    /// <summary>发起触发 / 传送 / 跨服时调用：接下来一段时间里，游戏因过图隐藏自定义 addon
+    /// 触发的 OnHide 都不写回窗口开关，Tick* 会在落地后自动把窗口重新打开。</summary>
+    private void GuardNativeWindows(TimeSpan duration)
+    {
+        var until = DateTime.UtcNow + duration;
+        if (until > this.nativeHideGuardUntil) this.nativeHideGuardUntil = until;
+    }
+
+    /// <summary>判断本次 OnHide 是不是「游戏临时隐藏」而不是「用户主动关窗」。</summary>
+    private bool ShouldIgnoreNativeClose()
+    {
+        // ① 自动前往 / 触发队列正在跑：三个主窗必须常驻，窗口开关不能被 hide 清掉
+        if (this.autoRunning || this.autoPaused) return true;
+        // ② 过图 / 切服瞬间：BetweenAreas、LocalPlayer 为空或还没登录，游戏会批量隐藏自定义 addon
+        try
+        {
+            if (!this.clientState.IsLoggedIn) return true;
+            if (this.condition[ConditionFlag.BetweenAreas]) return true;
+            if (this.objectTable.LocalPlayer is null) return true;
+        }
+        catch { return true; }
+        // ③ 刚发起过触发 / 传送：给一段保护期，覆盖落地前后多次 hide/show
+        return DateTime.UtcNow < this.nativeHideGuardUntil;
     }
 
     // ───────────── v1.1.71/72 原生窗口：桥接方法 ─────────────
@@ -3546,6 +3599,7 @@ public sealed partial class Plugin : IDalamudPlugin
             this.nativeHud = new NativeHudRuntime(this.BuildHudActions(),
                 this.BuildAutoWindowActions(),
                 this.BuildMainActions(),
+                this.BuildSettingsActions(),
                 msg => this.log.Info("[魔法水桶] " + msg));
             this.nativeHud.BeginInit(this.pi);
         }
@@ -3583,6 +3637,103 @@ public sealed partial class Plugin : IDalamudPlugin
         {
             try { this.log.Error(ex, "[魔法水桶] 主窗口原生同步异常，本帧跳过"); } catch { }
         }
+        // v1.2.7：原生设置面板（齿轮）。独立于主窗，异常只记日志不影响其它窗口。
+        try { h.TickSettings(this.settingsWindowOpen, this.BuildSettingsSnapshot()); }
+        catch (Exception ex)
+        {
+            try { this.log.Error(ex, "[魔法水桶] 设置面板原生同步异常，本帧跳过"); } catch { }
+        }
+    }
+
+    // ───────────── v1.2.7 原生设置面板：数据 / 委托桥 ─────────────
+    private SettingsActions BuildSettingsActions() => new SettingsActions
+    {
+        Toggle = key =>
+        {
+            switch (key)
+            {
+                case "main": this.mainWindowOpen = !this.mainWindowOpen; break;
+                case "auto": this.autoRunOpen = !this.autoRunOpen; break;
+                case "hud": this.autoHudOpen = !this.autoHudOpen; break;
+                case "summon":
+                    this.autoSummonMinion = !this.autoSummonMinion;
+                    if (this.autoSummonMinion) this.RefreshUnlockedMinions();
+                    this.SaveAutoSettings();
+                    break;
+                case "leave":
+                    this.autoLeaveDuty = !this.autoLeaveDuty;
+                    this.SaveAutoSettings();
+                    break;
+                case "return":
+                    this.autoConfirmReturn = !this.autoConfirmReturn;
+                    this.SaveAutoSettings();
+                    break;
+                case "theme": this.SetLightTheme(!this.lightMode); break;   // theme.txt 已持久化
+            }
+            this.nativeHud?.ForceSettingsRefresh();
+            this.nativeHud?.ForceMainRefresh();
+        },
+        // 和主窗「刷新」完全同一条链路：熊站击杀时间 + 实时排点 + 维护 T（force，立即对齐主站）
+        Refresh = () =>
+        {
+            if (this.srankData?.data is null) this.LoadSrankData();
+            this.MaybeStartBearFetch(true);
+            this.MaybeStartPointsFetch(true);
+            this.MaybeRefreshRestart(true);
+            this.nativeHud?.ForceMainRefresh();
+            this.Print("正在从熊站拉取最新击杀时间、维护 T 和实时排点…");
+        },
+        Closed = () => this.settingsWindowOpen = false,
+    };
+
+    private SettingsSnapshot BuildSettingsSnapshot() => new SettingsSnapshot
+    {
+        ShowMain = this.mainWindowOpen,
+        ShowAuto = this.autoRunOpen,
+        ShowHud = this.autoHudOpen,
+        AutoSummon = this.autoSummonMinion,
+        AutoLeave = this.autoLeaveDuty,
+        ConfirmReturn = this.autoConfirmReturn,
+        LightTheme = this.lightMode,
+        Status = this.restartAt > 0 ? $"维护 T 已同步 · {this.currentDc}" : $"当前大区 · {this.currentDc}",
+    };
+
+    private sealed class AutoSettings
+    {
+        public bool autoSummonMinion { get; set; }
+        public bool autoLeaveDuty { get; set; }
+        public bool autoConfirmReturn { get; set; } = true;
+    }
+
+    private string AutoSettingsFile => Path.Combine(this.pluginDirectory, "auto_settings.json");
+
+    private void LoadAutoSettings()
+    {
+        try
+        {
+            if (!File.Exists(this.AutoSettingsFile)) return;
+            var x = JsonSerializer.Deserialize<AutoSettings>(File.ReadAllText(this.AutoSettingsFile));
+            if (x is null) return;
+            this.autoSummonMinion = x.autoSummonMinion;
+            this.autoLeaveDuty = x.autoLeaveDuty;
+            this.autoConfirmReturn = x.autoConfirmReturn;
+        }
+        catch { /* 读不到就用旧版默认（全关 / 返回点确定默认开） */ }
+    }
+
+    private void SaveAutoSettings()
+    {
+        try
+        {
+            var x = new AutoSettings
+            {
+                autoSummonMinion = this.autoSummonMinion,
+                autoLeaveDuty = this.autoLeaveDuty,
+                autoConfirmReturn = this.autoConfirmReturn,
+            };
+            File.WriteAllText(this.AutoSettingsFile, JsonSerializer.Serialize(x));
+        }
+        catch { /* 写不进去只影响下次启动 */ }
     }
 
     // ───────────── v1.1.74 原生主窗口：数据 / 委托桥 ─────────────
@@ -3604,13 +3755,22 @@ public sealed partial class Plugin : IDalamudPlugin
             if (this.srankData?.data is null) this.LoadSrankData();
             this.MaybeStartBearFetch(true);
             this.MaybeStartPointsFetch(true);
-            this.Print("正在从熊站拉取最新击杀时间和实时排点…");
+            // v1.2.7：手动刷新立即拉一次维护重启时间 T（不等 60s 节流），让维护期概率
+            // 当场按 mt 重算，与主站对齐。T 回来后下一帧 Apply 就会用新值。
+            this.MaybeRefreshRestart(true);
+            this.nativeHud?.ForceMainRefresh();
+            this.Print("正在从熊站拉取最新击杀时间、维护 T 和实时排点…");
         },
         OpenAuto = () => this.autoRunOpen = !this.autoRunOpen,
         // v1.2.6 核弹级清扫：以下三个回调原本用来唤醒旧版 ImGui（完整版主窗 / 高级设置窗 / 收起小窗），
-        // 现在原生 KTK 已是唯一主力 UI，这些旧 GUI 入口全部封死，回调置空，绝不唤起任何 ImGui 窗口。
+        // 现在原生 KTK 已是唯一主力 UI。「完整 / 收起」两个按钮已在主窗隐藏，回调保持空操作；
+        // 齿轮改为打开 v1.2.7 新增的【原生 KTK 设置面板】，绝不唤起任何 ImGui 窗口。
         Legacy = () => { },
-        OpenSettings = () => { },
+        OpenSettings = () =>
+        {
+            this.settingsWindowOpen = !this.settingsWindowOpen;
+            this.nativeHud?.ForceSettingsRefresh();
+        },
         Mini = () => { },
         StopAll = () => this.StopAll(),
         AllWorlds = () =>
@@ -3651,7 +3811,10 @@ public sealed partial class Plugin : IDalamudPlugin
         FlagAetheryte = (m, c) => this.FlagAetheryte(m, c),       // v1.2.2：大水晶按钮 → 插旗到该区大水晶位置
         Expand = k => this.mainExpandedKey = k ?? "",
         SelectHuntWorld = (en, w) => this.huntWorld[en] = w,
-        Closed = () => this.mainWindowOpen = false,
+        // v1.2.7：过图 / 跨服时游戏会临时隐藏所有自定义 addon，OnHide → Closed() 会把开关
+        // 永久写成 false，导致「点开始触发后所有窗口都消失且再也回不来」。保护期内忽略回写，
+        // TickMain 在过图结束后会自动把窗口重新 Open。
+        Closed = () => { if (!this.ShouldIgnoreNativeClose()) this.mainWindowOpen = false; },
     };
 
     /// <summary>复刻 DrawHuntList 的筛选/聚合逻辑，产出原生主窗口的纯数据快照。</summary>
@@ -3837,6 +4000,8 @@ public sealed partial class Plugin : IDalamudPlugin
     /// <summary>主按钮 / 特殊目的地：复刻原 ImGui 展开行里的前往绿点 / 大水晶 / 丢弃 / 顾尼图逻辑。</summary>
     private void MainPrimary(string en, string world)
     {
+        // v1.2.7：点「执行触发」先开窗口保护，覆盖顾尼图这种不走 Goto 的特殊触发链
+        this.GuardNativeWindows(TimeSpan.FromMinutes(3));
         var data = this.srankData?.data;
         if (data is null) return;
         var h = data.hunts.FirstOrDefault(x => x.en == en);
@@ -4853,6 +5018,28 @@ public sealed partial class Plugin : IDalamudPlugin
         return lightTheme ? new Vector4(c.X * 0.72f, c.Y * 0.72f, c.Z * 0.72f, c.W) : c;
     }
 
+    /// <summary>v1.2.7：把缺 mt 的怪补成站点口径（0.6×rt，两只例外查表）。
+    /// 站点公式：pair = row[2] ? (hunt.mt || hunt.rt) : hunt.rt；T 主导时用 mt 覆盖 cd/win。
+    /// 老用户插件目录的 srank_data.json 是用户状态文件，部署时绝不能覆盖，只能在运行时补。</summary>
+    private void EnsureMaintPairs()
+    {
+        var d = this.srankData;
+        if (d is null) return;
+        void Fill(HuntData[]? hunts)
+        {
+            if (hunts is null) return;
+            foreach (var h in hunts)
+            {
+                if (h is null || h.mt is { Length: >= 2 }) continue;
+                h.mt = MaintPairOverride.TryGetValue(h.en, out var pair)
+                    ? (double[])pair.Clone()
+                    : new[] { h.cd * 0.6, h.win * 0.6 };
+            }
+        }
+        Fill(d.data?.hunts);
+        foreach (var dc in d.dcs) Fill(dc?.hunts);
+    }
+
     private void LoadSrankData()
     {
         try
@@ -4866,6 +5053,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 return;
             }
             this.srankData = JsonSerializer.Deserialize<DataFile>(File.ReadAllText(p));
+            this.EnsureMaintPairs();     // v1.2.7：旧数据文件没有 mt，运行时补齐，部署不必覆盖用户状态文件
             this.dataError = this.srankData?.data is null && this.srankData?.dcs.Count is null or 0
                 ? "数据文件解析为空：" + p : "";
             // 多大大区文件：按「上次选的大区 → 游戏所在大区 → 第一个」挑一份挂到 data 上
@@ -5075,6 +5263,15 @@ public sealed partial class Plugin : IDalamudPlugin
                 best = Math.Max(best, t.GetDouble());
         }
         return (huntEn, world, best);
+    }
+
+    /// <summary>每帧调度的 T 刷新（60s 节流）。force=true 用于「手动刷新」按钮，立即拉一次，
+    /// 让插件的概率数字当场和主站对齐（不等待节流窗口）。</summary>
+    private void MaybeRefreshRestart(bool force)
+    {
+        if (!force && DateTime.UtcNow - this.lastRestartFetch <= TimeSpan.FromSeconds(60)) return;
+        this.lastRestartFetch = DateTime.UtcNow;
+        _ = Task.Run(() => this.RefreshRestartAsync());
     }
 
     /// <summary>后台刷新全局重启时间 T（站点维护结束时间最大值，全国服共享）。失败沿用上次值。0 额外熊站请求。</summary>
@@ -5500,19 +5697,26 @@ public sealed partial class Plugin : IDalamudPlugin
             : $"已同步 {changed} 只 · {DateTime.Now:HH:mm}";
     }
 
-    /// <summary>按怪自己的冷却算状态：开闸 = lastDeath + cd，关窗 = lastDeath + cd + win。
-    /// cd/win 缺省（老数据）时退回全局 84h/48h。</summary>
+    /// <summary>按怪自己的冷却算状态：进闸 openAt = lastDeath + cd*3600，强制 forceAt = openAt + win*3600。
+    /// v1.2.7：与主站 site.html 的 SRKBoardStyle / r(t,o) 逐字对齐 ——
+    ///   cold(now&lt;openAt) → 0%；forced(now&gt;=forceAt) → 100%（clamp 到 100，不再返回 &gt;100 的裸值）；
+    ///   open → clamp((now-openAt)/(win*3600)*100, 0, 100)。
+    /// 站点 /api/live 只回基础数据（lastDeath + isMaint），概率本来就是前端算的，单位一律 0..100（不是 0..1）。
+    /// now 用 UTC Unix 秒（DateTimeOffset.UtcNow.ToUnixTimeSeconds），与站点 Date.now()/1000 同一基准，
+    /// 站点里 +8*3600 只用于「格式化成本地时间显示」，不参与概率计算，所以没有 8 小时错位。
+    /// cd/win 由调用方按 isMaint 选 rt 或 mt 传入；缺省（老数据）才退回全局 84h/48h。</summary>
     private static (string State, double Eta, double Pct) Calc(double lastDeath, double now, double cdH = 0, double winH = 0)
     {
         if (lastDeath <= 0) return ("unknown", 0, 0);
         var cd = cdH > 0 ? cdH : CdHours;
-        var win = winH > 0 ? winH : cd * 0.6;   // 站点 mt 恒为 rt 的 0.6，缺字段时按同一比例推
+        var win = winH > 0 ? winH : WinHours;
         var start = lastDeath + cd * 3600;
         var end = start + win * 3600;
-        if (now < start) return ("cd", start - now, 0);
-        var pct = (now - start) / (win * 3600) * 100;
-        if (now <= end) return ("open", end - now, pct);
-        return ("over", now - end, pct);
+        if (now < start) return ("cd", start - now, 0);                 // 站点 cold → 0%
+        if (now >= end) return ("over", now - end, 100);                // 站点 forced → clamped 100%
+        // 唯一可能产生 0..100 数值的分支；显式 clamp，杜绝 215% / 825% 这类溢出数值流进 UI
+        var pct = Math.Clamp((now - start) / (win * 3600) * 100.0, 0.0, 100.0);
+        return ("open", end - now, pct);
     }
 
     private static string Dur(double sec)
@@ -6832,6 +7036,7 @@ public sealed partial class Plugin : IDalamudPlugin
                     var on = QueryValue(path, "on");
                     if (on != null) this.autoSummonMinion = ParseOn(on);
                     if (this.autoSummonMinion) this.RefreshUnlockedMinions();
+                    this.SaveAutoSettings();
                     await WriteAsync(stream, 200, Json(ok: true, message: $"自动召唤随从：{(this.autoSummonMinion ? "已开启" : "已关闭")}"));
                     return;
                 }
@@ -6840,6 +7045,7 @@ public sealed partial class Plugin : IDalamudPlugin
                 {
                     var on = QueryValue(path, "on");
                     if (on != null) this.autoLeaveDuty = ParseOn(on);
+                    this.SaveAutoSettings();
                     await WriteAsync(stream, 200, Json(ok: true, message: $"独身自动退本：{(this.autoLeaveDuty ? "已开启" : "已关闭")}"));
                     return;
                 }
