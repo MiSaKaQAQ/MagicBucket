@@ -4295,8 +4295,6 @@ public sealed partial class Plugin : IDalamudPlugin
             if (!this.themeLoaded) { this.themeLoaded = true; this.LoadTheme(); }
             this.InitFontAtlasIfNeeded();
             this.DrawMiniWindow();
-            if (this.autoRunOpen && this.nativeHud?.AutoFallback == true) this.DrawAutoWindow();
-            if (this.autoHudOpen && this.nativeHud?.HudFallback == true) this.DrawAutoHud();
             return;
         }
         // 主窗关掉时，触发悬浮窗 / 自动前往窗仍要能独立显示（字体和主题照样初始化）
@@ -4306,8 +4304,6 @@ public sealed partial class Plugin : IDalamudPlugin
                 {
                     if (!this.themeLoaded) { this.themeLoaded = true; this.LoadTheme(); }
                     this.InitFontAtlasIfNeeded();
-                    if (this.autoRunOpen && this.nativeHud?.AutoFallback == true) this.DrawAutoWindow();
-                    if (this.autoHudOpen && this.nativeHud?.HudFallback == true) this.DrawAutoHud();
                 }
             return;
         }
@@ -4318,8 +4314,6 @@ public sealed partial class Plugin : IDalamudPlugin
             if (!this.themeLoaded) { this.themeLoaded = true; this.LoadTheme(); }
             this.InitFontAtlasIfNeeded();
             this.TrackFilterChanges();   // 原生版也要把筛选变更落盘，切大区才能原样恢复
-            if (this.autoRunOpen && this.nativeHud?.AutoFallback == true) this.DrawAutoWindow();
-            if (this.autoHudOpen && this.nativeHud?.HudFallback == true) this.DrawAutoHud();
             return;
         }
         if (!this.themeLoaded)
@@ -4389,8 +4383,6 @@ public sealed partial class Plugin : IDalamudPlugin
             ImGui.PopStyleColor(20);
             ImGui.PopStyleVar(9);
             ImGui.End();
-            if (this.autoRunOpen && this.nativeHud?.AutoFallback == true) this.DrawAutoWindow();
-            if (this.autoHudOpen && this.nativeHud?.HudFallback == true) this.DrawAutoHud();
         }
         catch
         {
