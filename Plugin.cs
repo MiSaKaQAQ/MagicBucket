@@ -397,9 +397,8 @@ public sealed partial class Plugin : IDalamudPlugin
         {
             HelpMessage = "魔法水桶：/水桶 打开游戏内窗口 · /水桶 history 打开 S 怪历史 · " +
                           "/水桶 sonar [test|probe|clear] 实时击杀自检 · " +
-                          "/水桶 trigger 查看已被他人触发的 S · /水桶 trigger main on|off 主站源开关 · " +
-                          "/水桶 trigger stuck on|off 闸后未死判定 · /水桶 trigger scan 演练判定 · " +
-                          "/水桶 trigger clear 清空黑名单 · " +
+                          "/水桶 trigger 查看已被他人触发的 S（与看板一致）· /水桶 trigger main on|off 看板源开关 · " +
+                          "/水桶 trigger scan 与看板对账 · /水桶 trigger clear 清空黑名单 · " +
                           "/水桶 nav <地图> <X> <Y>（开图插旗+vnav寻路） · " +
                           "/水桶 goto <地图> <X> <Y> [服务器] [分线] · /水桶 discard · /水桶 weea · " +
                           "/水桶 stop（取消全部自动流程） · " +
@@ -5661,10 +5660,6 @@ public sealed partial class Plugin : IDalamudPlugin
         _ = Task.Run(async () =>
         {
             var bag = new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
-            // v1.2.12：主站「这只怪现在活着/被触发」的可选信号（接口给了才有），与击杀时间分开收集
-            var trigBag = new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
-            // 负信号（接口明确说「没在打」）→ 立刻解除拉黑
-            var negBag = new System.Collections.Concurrent.ConcurrentDictionary<string, double>(StringComparer.Ordinal);
 
             // 首选：站点 /api/live?dc= 一次拿回本大区全服 × 全怪的击杀时间（后台 5 分钟刷一次，比逐条快两个数量级）
             if (dc.Length > 0)
@@ -5677,9 +5672,6 @@ public sealed partial class Plugin : IDalamudPlugin
                     {
                         var txt = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
                         using var doc = JsonDocument.Parse(txt);
-                        // v1.2.12：「已被触发」主站源。线上接口目前只有击杀时间，这里解析的是
-                        // triggered / engaged / spawned / relay 这类可选容器；没有就静默跳过。
-                        CollectTriggeredJson(doc.RootElement, trigBag, negBag);
                         if (doc.RootElement.TryGetProperty("live", out var lv) && lv.ValueKind == JsonValueKind.Object)
                         {
                             foreach (var w in lv.EnumerateObject())
@@ -5736,7 +5728,7 @@ public sealed partial class Plugin : IDalamudPlugin
 
             this.framework.RunOnTick(() =>
             {
-                try { this.ApplyBearResult(bag, trigBag, negBag); }
+                try { this.ApplyBearResult(bag); }
                 catch (Exception ex) { this.log.Warning("[SrankFlag] 熊站数据写入失败：" + ex.Message); }
                 this.bearFetching = false;
             });
@@ -5970,9 +5962,7 @@ public sealed partial class Plugin : IDalamudPlugin
         catch (Exception ex) { this.log.Warning("[SrankFlag] 读缓存失败：" + ex.Message); }
     }
 
-    private void ApplyBearResult(System.Collections.Concurrent.ConcurrentDictionary<string, double> map,
-                                 System.Collections.Concurrent.ConcurrentDictionary<string, double>? triggered = null,
-                                 System.Collections.Concurrent.ConcurrentDictionary<string, double>? negative = null)
+    private void ApplyBearResult(System.Collections.Concurrent.ConcurrentDictionary<string, double> map)
     {
         if (this.srankData?.data is not { } d) return;
         var hit = 0;
@@ -6019,12 +6009,11 @@ public sealed partial class Plugin : IDalamudPlugin
         // v1.2.12 历史：主站数据更新后再检测一次「新进闸」→ Spawn/MainSite。
         this.NoteMainSiteOpenStates(d);
 
-        // v1.2.12「已被触发」：三段状态机。
-        // 顺序很重要：先按最新的 lastDeath 解锁 → 再落主站接口给的明确信号/否认 → 最后按窗口分段
-        // 统一处理（冷却锁 / 闸内放行 / 闸后未死）。窗口判断放最后，才不会和刚写入的 lastDeath 打架。
+        // v1.2.13「已被触发」：与看板 bot_relay.json 的「已触发（当前在场）」同步。
+        // 顺序：先按最新 lastDeath 解锁（死了就放行）→ 再按看板在场的集合逐条对齐
+        // （在场则锁、不在场则解）。看板是唯一口径，插件不再自己推算窗口。
         this.SweepTriggeredByDeath();
-        this.ApplyMainSiteTriggered(triggered, negative, justDied);
-        this.SweepTriggeredWindow();
+        this.ApplyRelayTriggered(justDied);
 
         this.nativeHud?.ForceHistoryRefresh();
     }
