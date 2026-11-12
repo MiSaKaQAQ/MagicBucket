@@ -1,88 +1,86 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace SrankFlag;
 
 /// <summary>
-/// v1.2.12：「已被他人触发」黑名单 —— 与主站窗口状态严格对齐的三段状态机。
+/// v1.2.13：「已被他人触发」黑名单 —— 与主站看板 https://119.29.119.179/srank/ 的
+/// 「已触发（当前在场）」严格同源同口径。
 ///
-/// 【判定口径（用户 11-13 第三次定稿：历史触发但没被击杀 = 已触发未死）】
-///   把每只怪按主站 lastDeath 算出的窗口切成三段，**黑名单只在两端锁、中间放行**：
+/// 【为什么推倒 v1.2.12 的三段窗口推算】
+///   v1.2.12 用 lastDeath + cd/win 反推「进闸 / 闸后」，那是**猜**。实测代价：
+///   插件离线一段时间后 srank_data.json 陈旧，所有记录都落到「闸后段」⇒ 全表拉黑。
+///   而看板本来就有真实的「当前在场」数据，不需要猜。
 ///
-///     ① 冷却段  now &lt; ld+cd
-///        刚从主站拿到未消化的击杀记录 ⇒ 有人刚打过，锁（反正这段也打不了）。
-///        已被消化进 killedWatermark 的记录不再重复上锁（否则每次拉取都刷一遍红标）。
+/// 【看板口径（index.html 的 T(n,e)，逐字对应）】
+///   data = bot_relay.json
+///     { generated, relay: { 服: { 怪en: [播报时间, x, y] } } }
+///   一条 relay 记录「算在场」当且仅当：
+///     ① relay 里有这只怪（ts &gt; 0）；
+///     ② now - ts ≤ 20 小时            （看板：Date.now()/1e3 - t[0] &gt; 20*3600 → null）
+///     ③ 之后没有更新的击杀             （看板：C(n,e) &gt;= t[0]-30 → null）
+///   三条同时成立 ⇒ 看板显示红色「已触发」，插件同样标红、按钮置灰、自动前往跳过。
+///   任一条不成立 ⇒ 看板不标红，插件也必须放行（红标消失、按钮恢复、可自动前往）。
 ///
-///     ② 闸内段  ld+cd ≤ now &lt; ld+cd+win
-///        新周期已经打开 ⇒ 上一轮「被触发」的那只早就不在了，**解除主站来源的锁**，
-///        红标消失、按钮恢复、自动前往重新可选。这一段正是唯一该去打的窗口。
+///   即「主站说什么，插件就显示什么」，插件不再自己推算任何窗口。
 ///
-///     ③ 闸后段  now ≥ ld+cd+win    ← 本次新增的核心判定
-///        窗口整段走完，lastDeath 却没有任何更新 ⇒ 只有两种可能：
-///          a) 已经被人触发过、打了一半跑了 / 团灭了 / 卡在某个状态（烂尾）；
-///          b) 一直没人去。
-///        用户口径：这种情况**不判定为「可以打」**，而是判定「已经被人触发了，但没有死」，
-///        直接拉黑（Source=stuck），红标 [已触发]、按钮 [已被抢触]、自动前往跳过。
-///        这段的锁只能被「击杀」（lastDeath 越过水位）或 Sonar 脱战/重置播报解除。
+/// 【实测（11-13 05:05，bot_relay.json + /api/live?dc=豆豆柴）】
+///   relay 20 服 / 320 条：超 20h 过期 35 条、之后已被击杀 62 条 ⇒ 看板在场 223 条。
+///   逐服在场数 2..20，不是全表；对照 v1.2.12 的「全红」，差距就在这里。
 ///
-///   Sonar 出生播报仍然独立锁定（Source=sonar）：它证明「这一刻它已经刷出来了」，
-///   不受上面三段窗口逻辑影响，只认击杀 / 脱战 / 主站陈旧超时。
+/// 【Sonar 出生播报仍然独立锁定（Source=sonar）】
+///   它是「这一刻我刚看到它刷出来」的直接证据，比看板更快。只认击杀 / 脱战 / 超时兜底解除，
+///   不会被看板的「未在场」覆盖 —— 否则刚锁上就被下一轮 relay 同步解掉，等于白锁。
 ///
-/// 【为什么闸内必须放行，而不是继续锁】
-///   闸内 if 还锁着，自动前往就永远排不出任何任务 —— 那不是防抢，是自杀。
-///   闸内 = 新周期刚开 = 没有任何「已被触发」的证据（旧记录已随上一只怪一起消失）。
-///
-/// 【主站数据的事实（11-13 04:26 / 04:45 实测 http://119.29.119.179/api/live?dc=豆豆柴）】
-///   { generated, dc, source:"tracker",
-///     live: { 服: { 怪en: [[线, 击杀时间戳, 是否作废]] } }, relay: {}, trackerMeta, trackerStatus }
-///   键是满的（5 服 × 47 怪 = 235），但只有 91 个有真实记录（38.7%），其余是空数组 []。
-///   上游熊站 getHuntInfo / huntInfo 实测只返回 [{ID, Time, ReportTime, Reporter, Canceled}]，
-///   **没有任何 engaged / HP / 进度 / 血量字段** —— 所以「进闸」只能由 lastDeath + cd 推算，
-///   「被触发但没死」也只能由「闸走完却没新击杀」反推，不存在直接的存活信号。
-///
-///   04:45 实测这 91 条记录**全部还在冷却段**（age &lt; cd），闸内的 0 只、闸后 0 只。
-///   ⇒ 本规则上线当刻不会锁任何怪（不是空转，是当前数据确实没有烂尾样本）。
-///   另外 144 个槽位 lastDeath = 0（36h 内没有击杀记录，也无法确定窗口位置）：
-///   这些**不参与判定** —— 把「没有记录」当成「闸早就过了」会把半张表全锁死。
-///
-/// 【已消化击杀水位 killedWatermark】
-///   live 是约 36h 的击杀流水，同一条记录会被反复拉取十几次，故一次击杀用于解锁后
-///   把它的 ts 记为已消化，之后同一（或更旧）ts 不再上锁 / 不再重复判定。
-///
-/// 【持久化】独立文件 srank_triggered.json（v7：items / floors / killed / seen / src），
+/// 【持久化】独立文件 srank_triggered.json（v8：items/floors/killed/seen/src），
 ///   绝不触碰 5 个用户状态文件。键 = en|world（英文名跨语言稳定）。
 /// </summary>
 public sealed partial class Plugin
 {
     private const string TriggeredCacheFile = "srank_triggered.json";
 
-    /// <summary>主站源开关。Enabled = 按主站窗口状态判定；Disabled = 只认 Sonar。</summary>
+    /// <summary>看板「已触发（当前在场）」的数据源，静态文件，与 index.html 同源。</summary>
+    private const string RelayApi = "http://119.29.119.179/srank/bot_relay.json";
+
+    /// <summary>主站源开关。Enabled = 跟看板走；Disabled = 只认 Sonar 出生播报。</summary>
     private enum MainTriggerMode { Enabled, Disabled }
 
     private MainTriggerMode mainTriggerMode = MainTriggerMode.Enabled;
 
-    /// <summary>「闸后未死」判定开关。关掉后闸后段不拉黑（只保留冷却段记录锁 + Sonar）。</summary>
-    private bool stuckTriggerEnabled = true;
+    /// <summary>看板判据：relay 记录超过 20 小时不再算「在场」（与 index.html 的 20*3600 一致）。</summary>
+    private const double RelayMaxAgeSeconds = 20 * 3600;
 
-    /// <summary>兜底超时：主站数据陈旧时，超过这么久没被确认的条目自动解除。</summary>
+    /// <summary>看板判据：击杀时间只比 relay 晚 30 秒以内，仍算「同一次击杀前的播报」（容差，同 index.html）。</summary>
+    private const double RelayKillTolerance = 30;
+
+    /// <summary>relay 拉取间隔。站点约 5 分钟刷新一次，3 分钟拉一次足够跟手（14 KB 静态文件）。</summary>
+    private static readonly TimeSpan RelayInterval = TimeSpan.FromMinutes(3);
+
+    /// <summary>relay 超过这么久没成功拉取 ⇒ 认为主站挂了，超时兜底才开始生效。</summary>
+    private static readonly TimeSpan RelayStaleAfter = TimeSpan.FromMinutes(20);
+
+    /// <summary>主站陈旧时的兜底超时：超过这么久没被确认的条目自动解除。</summary>
     private static readonly TimeSpan TriggeredTimeout = TimeSpan.FromMinutes(10);
 
-    /// <summary>主站「数据陈旧」判据：超过它没成功拉取，才允许超时兜底生效。</summary>
-    private static readonly TimeSpan MainDataStaleAfter = TimeSpan.FromMinutes(10);
-
-    /// <summary>窗口状态机的节流间隔（闸会随时间自然切换段位，不能只在拉取时算）。</summary>
+    /// <summary>节流：主循环每 30 秒跑一次（拉 relay + 超时兜底）。</summary>
     private static readonly TimeSpan TriggeredSweepInterval = TimeSpan.FromSeconds(30);
 
     private DateTime lastTriggeredSweepUtc = DateTime.MinValue;
 
-    private const string SourceMain = "main";       // 主站明确信号（engaged / 非满血…，接口目前没有）
-    private const string SourceRecord = "record";   // 主站有未消化的击杀记录
-    private const string SourceStuck = "stuck";     // 闸已走完仍无击杀 = 已触发未死
+    private const string SourceRelay = "relay";     // 看板显示在场
     private const string SourceSonar = "sonar";     // Sonar 出生播报
+
+    /// <summary>relay 快照：服 → 怪en → [播报时间, x, y]。只在主线程读写。</summary>
+    private Dictionary<string, Dictionary<string, double[]>> relayLive = new(StringComparer.Ordinal);
+    private double relayGenerated;
+    private DateTime lastRelayFetch = DateTime.MinValue;
+    private DateTime lastRelayOk = DateTime.MinValue;
+    private bool relayFetching;
+    private string relayStatus = "看板未同步";
 
     /// <summary>装的是「标记时刻」而不是 true：界面上要显示什么时候锁的。</summary>
     private readonly Dictionary<string, double> triggeredMonsters = new(StringComparer.Ordinal);
@@ -94,25 +92,14 @@ public sealed partial class Plugin
     /// </summary>
     private readonly Dictionary<string, double> triggeredFloor = new(StringComparer.Ordinal);
 
-    /// <summary>锁的来源：record / stuck / main / sonar。决定闸内段能否解除它。</summary>
+    /// <summary>锁的来源：relay / sonar。决定看板撤下这条时能否自动解除。</summary>
     private readonly Dictionary<string, string> triggeredSource = new(StringComparer.Ordinal);
 
     /// <summary>最后一次「主站仍在确认这条锁」的时刻；主站陈旧时的超时兜底用它。</summary>
     private readonly Dictionary<string, double> triggeredSeen = new(StringComparer.Ordinal);
 
-    /// <summary>
-    /// 「已消化的击杀水位」：key → 我**已经处理过**的那次击杀时刻。
-    /// 防止同一条 live 记录在解锁后被反复拿来上锁。
-    /// </summary>
+    /// <summary>某次击杀已经用来解锁过 ⇒ 不再重复处理（防止同一轮反复刷 UI/日志）。</summary>
     private readonly Dictionary<string, double> killedWatermark = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// 「闸后判定已做过的 lastDeath」：key → 已经下过结论的那次死亡时刻。
-    /// 闸后段不能用 killedWatermark 去重（那里 wm 恒等于 ld，会把判定永久跳过），
-    /// 所以单独记一份：只有 lastDeath 又变了（说明中间死过一次、进入新周期）才重新判一次。
-    /// 同时让 /水桶 trigger clear 之后不会立刻把旧怪全部锁回。
-    /// </summary>
-    private readonly Dictionary<string, double> stuckJudged = new(StringComparer.Ordinal);
 
     private bool triggeredLoaded;
 
@@ -123,13 +110,11 @@ public sealed partial class Plugin
 
     private sealed class TriggeredFile
     {
-        public int v { get; set; } = 7;
-        public string mainMode { get; set; } = "on";   // on | off（旧文件可能是 auto / force）
-        public bool stuck { get; set; } = true;        // 闸后未死判定
+        public int v { get; set; } = 8;
+        public string mainMode { get; set; } = "on";   // on | off
         public Dictionary<string, double> items { get; set; } = new(StringComparer.Ordinal);
         public Dictionary<string, double> floors { get; set; } = new(StringComparer.Ordinal);
         public Dictionary<string, double> killed { get; set; } = new(StringComparer.Ordinal);
-        public Dictionary<string, double> judged { get; set; } = new(StringComparer.Ordinal);
         public Dictionary<string, double> seen { get; set; } = new(StringComparer.Ordinal);
         public Dictionary<string, string> src { get; set; } = new(StringComparer.Ordinal);
     }
@@ -141,13 +126,12 @@ public sealed partial class Plugin
     private static string SourceText(string? src) => src switch
     {
         SourceSonar => "Sonar出生",
-        SourceStuck => "闸过未死",
-        SourceRecord => "主站记录",
-        _ => "主站信号",
+        _ => "看板在场",
     };
 
-    /// <summary>是否「主站侧」的锁（闸内段可以解除）。Sonar 出生锁不在此列。</summary>
-    private static bool IsMainSide(string? src) => !string.Equals(src, SourceSonar, StringComparison.Ordinal);
+    /// <summary>是否「主站侧」的锁（看板撤下时自动解除）。Sonar 出生锁不在此列。</summary>
+    private static bool IsMainSide(string? src) =>
+        !string.Equals(src, SourceSonar, StringComparison.Ordinal);
 
     // ───────────────────── 读写 ─────────────────────
 
@@ -164,8 +148,6 @@ public sealed partial class Plugin
             this.mainTriggerMode = (f.mainMode ?? "").Trim().ToLowerInvariant() == "off"
                 ? MainTriggerMode.Disabled
                 : MainTriggerMode.Enabled;
-            // v7 之前没有 stuck 字段：默认开启（用户 11-13 明确要求）
-            this.stuckTriggerEnabled = f.stuck;
 
             if (f.items is not null)
                 foreach (var kv in f.items)
@@ -175,10 +157,11 @@ public sealed partial class Plugin
                     this.triggeredFloor[kv.Key] = f.floors is not null && f.floors.TryGetValue(kv.Key, out var fl)
                         ? fl
                         : kv.Value;
-                    // v5 之前没有 src：老条目一律按 record 处理（它们当年都是主站记录锁的）
-                    this.triggeredSource[kv.Key] = f.src is not null && f.src.TryGetValue(kv.Key, out var s) && s.Length > 0
-                        ? s
-                        : SourceRecord;
+                    // 旧文件（v7 及以前）的 record / stuck / main 都是主站侧，统一当 relay 处理
+                    this.triggeredSource[kv.Key] = f.src is not null && f.src.TryGetValue(kv.Key, out var s) &&
+                                                   string.Equals(s, SourceSonar, StringComparison.Ordinal)
+                        ? SourceSonar
+                        : SourceRelay;
                     this.triggeredSeen[kv.Key] = f.seen is not null && f.seen.TryGetValue(kv.Key, out var sn)
                         ? sn
                         : kv.Value;
@@ -186,9 +169,6 @@ public sealed partial class Plugin
             if (f.killed is not null)
                 foreach (var kv in f.killed)
                     if (kv.Key.Length > 0 && kv.Value > 0) this.killedWatermark[kv.Key] = kv.Value;
-            if (f.judged is not null)
-                foreach (var kv in f.judged)
-                    if (kv.Key.Length > 0 && kv.Value > 0) this.stuckJudged[kv.Key] = kv.Value;
         }
         catch (Exception ex) { this.log.Warning("[SrankFlag.Trigger] 读黑名单失败：" + ex.Message); }
     }
@@ -199,13 +179,11 @@ public sealed partial class Plugin
         {
             var f = new TriggeredFile
             {
-                v = 7,
+                v = 8,
                 mainMode = MainModeText(this.mainTriggerMode),
-                stuck = this.stuckTriggerEnabled,
                 items = this.triggeredMonsters,
                 floors = this.triggeredFloor,
                 killed = this.killedWatermark,
-                judged = this.stuckJudged,
                 seen = this.triggeredSeen,
                 src = this.triggeredSource,
             };
@@ -225,11 +203,11 @@ public sealed partial class Plugin
     // ───────────────────── 写入 / 解锁 ─────────────────────
 
     /// <summary>
-    /// 拉黑。已锁的保持水位与时刻，但会刷新「主站仍在确认」的时刻（让超时兜底不会误伤）。
+    /// 拉黑。已锁的保持水位与时刻，只刷新「主站仍在确认」的时刻（让超时兜底不会误伤）。
     /// 返回是否为新拉黑。
     /// </summary>
     private bool MarkTriggered(string en, string world, double deathFloor, double at, string reason,
-                               string source = SourceMain)
+                               string source = SourceRelay)
     {
         if (en.Length == 0 || world.Length == 0) return false;
         this.LoadTriggered();
@@ -253,8 +231,9 @@ public sealed partial class Plugin
     }
 
     /// <summary>
-    /// 解锁。killedAt &gt; 0 表示这次解锁由击杀造成，要写进已消化水位
-    /// （否则主站下一轮会把同一条击杀记录再锁回来）。返回是否真的从黑名单移除了。
+    /// 解锁。killedAt &gt; 0 表示这次解锁由击杀造成，要写进已消化水位。
+    /// onlyIfSource 非空时，只有该来源的锁才会被解除（看板撤下时不能动 Sonar 出生锁）。
+    /// 返回是否真的从黑名单移除了。
     /// </summary>
     private bool ClearTriggered(string en, string world, string reason, double killedAt = 0, string? onlyIfSource = null)
     {
@@ -305,9 +284,6 @@ public sealed partial class Plugin
                     var key = TrigKey(h.en, w.world);
                     this.killedWatermark.TryGetValue(key, out var prev);
                     if (w.lastDeath > prev) this.killedWatermark[key] = w.lastDeath;
-                    // 闸后判定也要设基线：否则 clear 之后一轮 sweep 就把所有「窗口已过」的怪全锁回来
-                    this.stuckJudged.TryGetValue(key, out var jprev);
-                    if (w.lastDeath > jprev) this.stuckJudged[key] = w.lastDeath;
                 }
     }
 
@@ -347,203 +323,93 @@ public sealed partial class Plugin
         this.nativeHud?.ForceMainRefresh();
     }
 
-    /// <summary>用维护后再生（mt）覆盖 cd/win —— 与 Calc / 主窗显示同一口径。</summary>
-    private (double Cd, double Win) WindowOf(HuntData h, double lastDeath)
+    // ───────────────────── 看板 relay 同步 ─────────────────────
+
+    /// <summary>看板数据是否已经陈旧（超过 20 分钟没成功拉取，或从未成功）。</summary>
+    private bool RelayStale =>
+        this.lastRelayOk == DateTime.MinValue || DateTime.UtcNow - this.lastRelayOk > RelayStaleAfter;
+
+    /// <summary>按 3 分钟节流拉一次看板 relay 快照（force 用于刚启动/手动）。</summary>
+    private void MaybeFetchRelay(bool force)
     {
-        var maint = this.restartAt > 0 && lastDeath > 0 && this.restartAt > lastDeath;
-        var cd = maint && h.mt is { Length: >= 1 } ? h.mt[0] : h.cd;
-        var win = maint && h.mt is { Length: >= 2 } ? h.mt[1] : h.win;
-        return (cd, win);
+        if (this.relayFetching) return;
+        if (!force && DateTime.UtcNow - this.lastRelayFetch < RelayInterval) return;
+        this.relayFetching = true;
+        this.lastRelayFetch = DateTime.UtcNow;
+        _ = Task.Run(() => this.FetchRelayAsync());
     }
 
-    /// <summary>
-    /// 【核心】按窗口三段同步黑名单（每 30s + 每次主站拉取后跑一次）。
-    ///
-    ///   cd 段（now &lt; ld+cd）  ：有未消化的击杀记录 ⇒ 锁（record）。已消化的不再重复上锁。
-    ///   open 段（闸内）        ：解除主站侧的锁 —— 新周期开始，上一只「被触发」的怪已不在。
-    ///   over 段（闸已走完）     ：仍无新击杀 ⇒ 已触发未死 ⇒ 锁（stuck），直到它真的被击杀。
-    ///
-    /// 段位判定直接复用 Calc()，与主窗「开闸 / 冷却 / 已过窗」显示永远一致。
-    /// lastDeath &lt;= 0 的槽位直接跳过：没有死亡时间就没有窗口，无法区分「还没开闸」与「刷出很久没人打」。
-    /// </summary>
-    private void SweepTriggeredWindow()
+    private async Task FetchRelayAsync()
     {
-        if (this.srankData?.dcs is not { Count: > 0 } dcs) return;
-        var mainOn = this.mainTriggerMode == MainTriggerMode.Enabled;
-        if (!mainOn && !this.stuckTriggerEnabled) return;
-
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var added = 0;
-        var released = 0;
-        var changed = false;
-
-        foreach (var dc in dcs)
-            foreach (var h in dc.hunts)
-                foreach (var w in h.worlds)
-                {
-                    var ld = w.lastDeath;
-                    if (ld <= 0) continue;                       // 无记录 = 无法定位窗口，不判定
-                    var (cd, win) = this.WindowOf(h, ld);
-                    if (cd <= 0) continue;
-
-                    var state = Calc(ld, now, cd, win).State;
-                    var key = TrigKey(h.en, w.world);
-                    var locked = this.triggeredMonsters.ContainsKey(key);
-                    this.triggeredSource.TryGetValue(key, out var src);
-
-                    if (state == "cd")
-                    {
-                        if (!mainOn || locked) continue;
-                        // 已消化的击杀不再上锁：否则每次拉取都给同一只怪刷一遍红标
-                        this.killedWatermark.TryGetValue(key, out var wm);
-                        if (ld <= wm) continue;
-                        if (this.MarkTriggered(h.en, w.world, ld, now, "主站击杀记录（冷却中）", SourceRecord))
-                        { added++; changed = true; }
-                    }
-                    else if (state == "open")
-                    {
-                        // 闸内 = 新周期 = 上一只被触发的实例已经不存在了 ⇒ 放行
-                        if (!locked || !IsMainSide(src)) continue;
-                        if (this.ClearTriggered(h.en, w.world, "闸已开（新周期放行）", ld)) released++;
-                        this.killedWatermark.TryGetValue(key, out var wm2);
-                        if (ld > wm2) { this.killedWatermark[key] = ld; changed = true; }
-                    }
-                    else // "over"：窗口整段走完，lastDeath 却没有更新
-                    {
-                        if (!mainOn || !this.stuckTriggerEnabled || locked) continue;
-                        // 同一份 lastDeath 只判一次：判过就记进 stuckJudged，只有它又死过一次
-                        // （ld 变大、进入新周期）才允许重新判定。这样「主站否认 → 解锁」不会被
-                        // 下一轮 sweep 立刻锁回来，/水桶 trigger clear 也不会清完就回弹。
-                        this.stuckJudged.TryGetValue(key, out var judged);
-                        if (ld <= judged) continue;
-                        this.stuckJudged[key] = ld;
-                        changed = true;
-                        if (this.MarkTriggered(h.en, w.world, ld, now,
-                                "闸已走完仍未击杀（判定为已触发未死）", SourceStuck))
-                            added++;
-                    }
-                }
-
-        if (changed) this.SaveTriggered();
-        if (added > 0 || released > 0)
-            this.log.Information(
-                $"[SrankFlag.Trigger] 窗口同步：新增锁 {added} 只 / 闸开放行 {released} 只，" +
-                $"当前共 {this.triggeredMonsters.Count} 只（主站 {MainModeText(this.mainTriggerMode)}，闸后判定 {(this.stuckTriggerEnabled ? "开" : "关")}）");
-    }
-
-    /// <summary>主站数据是否已经陈旧（超过 10 分钟没成功拉取，或从未成功）。</summary>
-    private bool MainDataStale =>
-        this.lastBearOk == default || DateTime.UtcNow - this.lastBearOk > MainDataStaleAfter;
-
-    /// <summary>
-    /// 超时兜底：**只在主站数据陈旧时生效**。主站正常时每一轮确认都会刷新 triggeredSeen，
-    /// 这条永远不该解除任何条目 —— 否则刚锁上的怪会被无脑放掉，防抢就白做了。
-    /// </summary>
-    private void SweepStaleByTimeout()
-    {
-        if (this.triggeredMonsters.Count == 0) return;
-        if (!this.MainDataStale) return;
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var drop = this.triggeredMonsters.Keys
-            .Where(k => now - (this.triggeredSeen.TryGetValue(k, out var s) && s > 0 ? s : 0) > TriggeredTimeout.TotalSeconds)
-            .ToList();
-        if (drop.Count == 0) return;
-        foreach (var k in drop)
+        try
         {
-            this.triggeredMonsters.Remove(k);
-            this.triggeredFloor.Remove(k);
-            this.triggeredSource.Remove(k);
-            this.triggeredSeen.Remove(k);
-        }
-        this.SaveTriggered();
-        this.log.Warning($"[SrankFlag.Trigger] 主站数据陈旧，超时兜底解锁 {drop.Count} 只");
-        this.nativeHud?.ForceMainRefresh();
-    }
-
-    /// <summary>主循环里按 30s 节流调用：窗口三段同步 + 主站陈旧超时。</summary>
-    private void TickTriggeredSweep()
-    {
-        if (DateTime.UtcNow - this.lastTriggeredSweepUtc < TriggeredSweepInterval) return;
-        this.lastTriggeredSweepUtc = DateTime.UtcNow;
-        try { this.SweepTriggeredWindow(); } catch (Exception ex) { this.log.Warning("[SrankFlag.Trigger] 窗口同步失败：" + ex.Message); }
-        try { this.SweepStaleByTimeout(); } catch (Exception ex) { this.log.Warning("[SrankFlag.Trigger] 超时兜底失败：" + ex.Message); }
-    }
-
-    // ───────────────────── 主站源：明确状态字段解析 ─────────────────────
-
-    /// <summary>
-    /// 从 /api/live 的 JSON 里挑出「这只怪当前被触发 / 明确未被触发」的信号。
-    ///
-    /// 正信号容器（存在且为真）：triggered / engaged / isEngaged / spawned / engagedBy / relay
-    /// 负信号：同一容器存在但值为 false / 0 / 空数组 / 空对象 ⇒ 主站明确说「没在打」。
-    /// 血量类（若站点将来给出对象结构）：hp / currentHp / hpPercent / currentHpPercent / progress
-    ///   · 0 &lt; v &lt; maxHp（或 &lt; 100）→ 正在被打 → 正信号
-    ///   · v &lt;= 0 或 v &gt;= maxHp / 100 → 满血或归零 → 负信号
-    ///
-    /// 线上接口目前只有击杀时间，这些容器全都不存在，函数会静默返回。
-    /// 只往传入的并发字典里塞字符串，绝不碰共享状态（在 HTTP 线程上跑）。
-    /// </summary>
-    internal static void CollectTriggeredJson(
-        JsonElement root,
-        ConcurrentDictionary<string, double> positive,
-        ConcurrentDictionary<string, double>? negative = null)
-    {
-        if (root.ValueKind != JsonValueKind.Object) return;
-        var stamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-
-        foreach (var field in new[] { "triggered", "engaged", "isEngaged", "spawned", "engagedBy", "relay" })
-        {
-            if (!root.TryGetProperty(field, out var block)) continue;
-            if (block.ValueKind != JsonValueKind.Object) continue;
-            foreach (var world in block.EnumerateObject())
+            using var resp = await BearHttp.Value.GetAsync(RelayApi).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode)
             {
-                if (world.Value.ValueKind != JsonValueKind.Object) continue;
-                foreach (var hunt in world.Value.EnumerateObject())
-                {
-                    var key = TrigKey(hunt.Name, world.Name);
-                    if (TriggeredTruthy(hunt.Value)) positive[key] = stamp;
-                    else negative?[key] = stamp;
-                }
+                this.relayStatus = $"看板拉取失败 HTTP {(int)resp.StatusCode}";
+                return;
             }
-        }
-
-        foreach (var field in new[] { "hp", "currentHp", "hpPercent", "currentHpPercent", "progress" })
-        {
-            if (!root.TryGetProperty(field, out var block)) continue;
-            if (block.ValueKind != JsonValueKind.Object) continue;
-            foreach (var world in block.EnumerateObject())
+            var txt = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using var doc = JsonDocument.Parse(txt);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("relay", out var rl) ||
+                rl.ValueKind != JsonValueKind.Object)
             {
-                if (world.Value.ValueKind != JsonValueKind.Object) continue;
-                foreach (var hunt in world.Value.EnumerateObject())
-                {
-                    if (hunt.Value.ValueKind != JsonValueKind.Number) continue;
-                    if (!hunt.Value.TryGetDouble(out var v)) continue;
-                    double max = 0;
-                    if (world.Value.TryGetProperty("maxHp", out var mx) && mx.ValueKind == JsonValueKind.Number)
-                        mx.TryGetDouble(out max);
-                    var ceiling = max > 0 ? max : 100;
-                    var key = TrigKey(hunt.Name, world.Name);
-                    if (v > 0 && v < ceiling) positive[key] = stamp;
-                    else negative?[key] = stamp;
-                }
+                this.relayStatus = "看板返回格式异常";
+                return;
             }
+
+            var gen = 0.0;
+            if (root.TryGetProperty("generated", out var g) && g.ValueKind == JsonValueKind.Number)
+                g.TryGetDouble(out gen);
+
+            var parsed = new Dictionary<string, Dictionary<string, double[]>>(StringComparer.Ordinal);
+            var total = 0;
+            foreach (var w in rl.EnumerateObject())
+            {
+                if (w.Value.ValueKind != JsonValueKind.Object) continue;
+                var m = new Dictionary<string, double[]>(StringComparer.Ordinal);
+                foreach (var hh in w.Value.EnumerateObject())
+                {
+                    if (hh.Value.ValueKind != JsonValueKind.Array) continue;
+                    var arr = hh.Value;
+                    if (arr.GetArrayLength() < 3) continue;
+                    if (arr[0].ValueKind != JsonValueKind.Number || !arr[0].TryGetDouble(out var ts) || ts <= 0)
+                        continue;
+                    var x = arr[1].ValueKind == JsonValueKind.Number && arr[1].TryGetDouble(out var xv) ? xv : 0;
+                    var y = arr[2].ValueKind == JsonValueKind.Number && arr[2].TryGetDouble(out var yv) ? yv : 0;
+                    m[hh.Name] = new[] { ts, x, y };
+                    total++;
+                }
+                if (m.Count > 0) parsed[w.Name] = m;
+            }
+
+            _ = this.framework.RunOnTick(() =>
+            {
+                try
+                {
+                    this.relayLive = parsed;
+                    this.relayGenerated = gen;
+                    this.lastRelayOk = DateTime.UtcNow;
+                    this.relayStatus = $"看板已同步 {parsed.Count} 服 / {total} 条 · {DateTime.Now:HH:mm}";
+                    // 拉到新快照立刻重算一次，不让用户等 30 秒节拍
+                    this.ApplyRelayTriggered(null);
+                }
+                catch (Exception ex)
+                {
+                    this.log.Warning("[SrankFlag.Trigger] relay 写入失败：" + ex.Message);
+                }
+                finally { this.relayFetching = false; }
+            });
+        }
+        catch (Exception ex)
+        {
+            this.relayFetching = false;
+            this.relayStatus = "看板拉取异常：" + ex.Message;
+            this.log.Warning("[SrankFlag.Trigger] 看板 relay 拉取失败：" + ex.Message);
         }
     }
-
-    private static bool TriggeredTruthy(JsonElement e) => e.ValueKind switch
-    {
-        JsonValueKind.True => true,
-        JsonValueKind.Number => e.TryGetDouble(out var d) && d > 0,
-        JsonValueKind.String => e.GetString() is { Length: > 0 } s &&
-                                !s.Equals("false", StringComparison.OrdinalIgnoreCase) &&
-                                !s.Equals("dead", StringComparison.OrdinalIgnoreCase),
-        // 数组按 /api/live 的行格式理解：[线, 时间戳, 是否作废]。整批都被作废的不算。
-        JsonValueKind.Array => e.EnumerateArray().Any(row =>
-            !(row.ValueKind == JsonValueKind.Array && row.GetArrayLength() >= 3 &&
-              row[2].ValueKind == JsonValueKind.True)),
-        JsonValueKind.Object => e.EnumerateObject().Any(),
-        _ => false,
-    };
 
     /// <summary>当前大区里这只怪在该服的 lastDeath；查不到返回 0（= 从没死过）。</summary>
     private double DeathOf(string en, string world)
@@ -559,95 +425,160 @@ public sealed partial class Plugin
     }
 
     /// <summary>
-    /// 主站源的精确定时信号（接口目前没有，站点将来补 engaged / relay / 非满血 才会走到这里）。
+    /// 【核心】把黑名单对齐到看板「已触发（当前在场）」，与 index.html 的 T() 逐条同口径：
+    ///   relay 有记录 + 未超 20 小时 + 之后没有更新的击杀  ⇒ 在场 ⇒ 拉黑；
+    ///   否则 ⇒ 不在场 ⇒ 解除主站侧的锁（Sonar 出生锁不动）。
     ///
-    /// 只处理两类：
-    ///   ① 明确正信号 → 锁（Source=main），锁定水位取当前 lastDeath；
-    ///   ② 明确负信号（false / 满血 / 空数组）→ 立刻解锁，红标消失、按钮恢复可点。
-    ///
-    /// 窗口三段（冷却记录 / 闸内放行 / 闸后未死）全部在 SweepTriggeredWindow 里统一算，
-    /// 不在这里重复，避免两处口径打架。
+    /// 这是「显示什么」的唯一来源：插件不再自己推算窗口，因此不可能再出现「全表拉黑」。
+    /// justDied 是本轮刚确认死亡的组合，直接跳过（避免同一轮刚解锁又锁回）。
     /// </summary>
-    private void ApplyMainSiteTriggered(
-        ConcurrentDictionary<string, double>? explicitSignals,
-        ConcurrentDictionary<string, double>? negativeSignals,
-        HashSet<string>? justDied)
+    private void ApplyRelayTriggered(HashSet<string>? justDied)
     {
         this.LoadTriggered();
-        if (this.mainTriggerMode == MainTriggerMode.Disabled) return;
+        if (this.mainTriggerMode == MainTriggerMode.Disabled)
+        {
+            // 关掉看板源：把看板侧的锁一并放掉，只留 Sonar 出生锁。
+            // 否则这些红标会永远留着（relay 正常时超时兜底不会生效）。
+            this.ReleaseAllMainSide("看板源已关闭");
+            return;
+        }
+        if (this.relayLive.Count == 0) return;   // 从未成功拉取 → 不动现有状态，避免把锁全放掉
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var expect = new HashSet<string>(StringComparer.Ordinal);
+        var expectTs = new Dictionary<string, double>(StringComparer.Ordinal);
+
+        foreach (var worldKv in this.relayLive)
+        {
+            var world = worldKv.Key;
+            foreach (var huntKv in worldKv.Value)
+            {
+                var row = huntKv.Value;
+                if (row is null || row.Length < 1 || row[0] <= 0) continue;
+                if (now - row[0] > RelayMaxAgeSeconds) continue;                 // 看板：超 20h 不算在场
+                var key = TrigKey(huntKv.Key, world);
+                if (justDied is not null && justDied.Contains(key)) continue;     // 本轮刚死
+                if (this.DeathOf(huntKv.Key, world) >= row[0] - RelayKillTolerance)
+                    continue;                                                    // 看板：之后有击杀 = 已死
+                expect.Add(key);
+                expectTs[key] = row[0];
+            }
+        }
 
         var added = 0;
-        var cleared = 0;
-
-        // ── ① 主站明确否认：立刻解除（红标消失、按钮恢复可点）
-        if (negativeSignals is { IsEmpty: false })
+        foreach (var key in expect)
         {
-            foreach (var kv in negativeSignals)
-            {
-                if (justDied is not null && justDied.Contains(kv.Key)) continue;
-                if (explicitSignals is not null && explicitSignals.ContainsKey(kv.Key)) continue;   // 自相矛盾时以正信号为准
-                var seg = kv.Key.Split('|');
-                if (seg.Length != 2) continue;
-                if (this.ClearTriggered(seg[0], seg[1], "主站明确未触发")) cleared++;
-            }
+            var seg = key.Split('|');
+            if (seg.Length != 2) continue;
+            if (this.MarkTriggered(seg[0], seg[1], this.DeathOf(seg[0], seg[1]), expectTs[key],
+                    "看板显示已触发（当前在场）", SourceRelay))
+                added++;
+            // 每一轮都算「主站仍在确认」，否则超时兜底会把还在场的怪误放
+            this.triggeredSeen[key] = now;
         }
 
-        // ── ② 主站明确信号：engaged / isEngaged / spawned / 非满血 等
-        if (explicitSignals is { IsEmpty: false })
+        // 反向同步：看板已经不显示它了 ⇒ 放行（Sonar 出生锁例外，只认击杀/脱战）
+        List<(string En, string World)>? drop = null;
+        foreach (var key in this.triggeredMonsters.Keys.ToList())
         {
-            foreach (var kv in explicitSignals)
-            {
-                if (justDied is not null && justDied.Contains(kv.Key)) continue;
-                var seg = kv.Key.Split('|');
-                if (seg.Length != 2) continue;
-                if (this.MarkTriggered(seg[0], seg[1], this.DeathOf(seg[0], seg[1]), kv.Value,
-                                       "主站明确信号（正在被触发）", SourceMain))
-                    added++;
-            }
+            if (expect.Contains(key)) continue;
+            this.triggeredSource.TryGetValue(key, out var src);
+            if (!IsMainSide(src)) continue;
+            var seg = key.Split('|');
+            if (seg.Length != 2) continue;
+            (drop ??= new List<(string, string)>()).Add((seg[0], seg[1]));
         }
+        var released = 0;
+        if (drop is not null)
+            foreach (var (en, world) in drop)
+                if (this.ClearTriggered(en, world, "看板已不再显示该怪在场"))
+                    released++;
 
-        if (added > 0 || cleared > 0)
+        if (added > 0 || released > 0)
             this.log.Information(
-                $"[SrankFlag.Trigger] 主站信号：新增 {added} 只 / 解除 {cleared} 只，" +
-                $"当前共 {this.triggeredMonsters.Count} 只");
+                $"[SrankFlag.Trigger] 看板同步：新增 {added} 只 / 放行 {released} 只，" +
+                $"当前共 {this.triggeredMonsters.Count} 只（看板在场 {expect.Count}）");
     }
 
-    // ───────────────────── /水桶 trigger：查看 / 开关 / 演练 / 清空 ─────────────────────
+    /// <summary>释放所有「主站侧」的锁，保留 Sonar 出生锁。用于关掉看板源时收尾。</summary>
+    private void ReleaseAllMainSide(string reason)
+    {
+        var keys = this.triggeredMonsters.Keys.ToList();
+        if (keys.Count == 0) return;
+        var n = 0;
+        foreach (var key in keys)
+        {
+            this.triggeredSource.TryGetValue(key, out var src);
+            if (!IsMainSide(src)) continue;
+            var seg = key.Split('|');
+            if (seg.Length != 2) continue;
+            if (this.ClearTriggered(seg[0], seg[1], reason)) n++;
+        }
+        if (n > 0) this.log.Information($"[SrankFlag.Trigger] {reason}：放行 {n} 只");
+    }
+
+    /// <summary>
+    /// 超时兜底：**只在看板数据陈旧时生效**（看板挂了 / 网络断了）。
+    /// 看板正常时每一轮同步都会刷新 triggeredSeen，这条永远不该解除任何条目。
+    /// </summary>
+    private void SweepStaleByTimeout()
+    {
+        if (this.triggeredMonsters.Count == 0) return;
+        if (!this.RelayStale) return;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var drop = this.triggeredMonsters.Keys
+            .Where(k => now - (this.triggeredSeen.TryGetValue(k, out var s) && s > 0 ? s : 0) > TriggeredTimeout.TotalSeconds)
+            .ToList();
+        if (drop.Count == 0) return;
+        foreach (var k in drop)
+        {
+            this.triggeredMonsters.Remove(k);
+            this.triggeredFloor.Remove(k);
+            this.triggeredSource.Remove(k);
+            this.triggeredSeen.Remove(k);
+        }
+        this.SaveTriggered();
+        this.log.Warning($"[SrankFlag.Trigger] 看板数据陈旧，超时兜底解锁 {drop.Count} 只");
+        this.nativeHud?.ForceMainRefresh();
+    }
+
+    /// <summary>主循环里按 30s 节流调用：拉看板 relay + 主站陈旧超时兜底。</summary>
+    private void TickTriggeredSweep()
+    {
+        // 首次启动立刻拉一次，不等 3 分钟节流
+        if (this.lastRelayOk == DateTime.MinValue && this.lastRelayFetch == DateTime.MinValue)
+            this.MaybeFetchRelay(true);
+
+        if (DateTime.UtcNow - this.lastTriggeredSweepUtc < TriggeredSweepInterval) return;
+        this.lastTriggeredSweepUtc = DateTime.UtcNow;
+        // relay 快照未变时这里的 Apply 只是把 seen 刷新到 now（幂等，不写盘就不会有 IO）
+        try { this.ApplyRelayTriggered(null); } catch (Exception ex) { this.log.Warning("[SrankFlag.Trigger] 看板同步失败：" + ex.Message); }
+        try { this.SweepStaleByTimeout(); } catch (Exception ex) { this.log.Warning("[SrankFlag.Trigger] 超时兜底失败：" + ex.Message); }
+        this.MaybeFetchRelay(false);
+    }
+
+    // ───────────────────── /水桶 trigger：查看 / 开关 / 对账 / 清空 ─────────────────────
 
     private void TriggerCommand(string[] parts)
     {
         this.LoadTriggered();
         var sub = parts.Length > 1 ? parts[1].ToLowerInvariant() : "";
 
-        // /水桶 trigger main on|off —— 主站源开关（auto / force 为旧命令，等价于 on）
-        if (sub == "main")
+        // /水桶 trigger main on|off —— 看板源开关（auto / force / stuck 为旧命令，等价于 on）
+        if (sub == "main" || sub == "stuck")
         {
             var arg = parts.Length > 2 ? parts[2].ToLowerInvariant() : "";
             this.mainTriggerMode = arg == "off" ? MainTriggerMode.Disabled : MainTriggerMode.Enabled;
             this.SaveTriggered();
             var desc = this.mainTriggerMode == MainTriggerMode.Disabled
-                ? "关闭：主站不再参与判定，只认 Sonar 出生播报"
-                : "开启：冷却段锁记录 / 闸内放行 / 闸后未死上锁（默认）";
-            this.Print($"主站源 = {MainModeText(this.mainTriggerMode)}（{desc}）。" +
-                       "30 秒内自动生效（/水桶 trigger scan 可立刻看判定结果）。");
+                ? "关闭：主站/看板不再参与判定，只认 Sonar 出生播报"
+                : "开启：跟看板「已触发（当前在场）」完全一致（默认）";
+            this.Print($"看板源 = {MainModeText(this.mainTriggerMode)}（{desc}）。" +
+                       "3 分钟内自动生效（/水桶 trigger scan 可立刻对账）。");
             return;
         }
 
-        // /水桶 trigger stuck on|off —— 「闸已走完仍未击杀 = 已触发未死」判定
-        if (sub == "stuck")
-        {
-            var arg = parts.Length > 2 ? parts[2].ToLowerInvariant() : "";
-            this.stuckTriggerEnabled = arg != "off";
-            this.SaveTriggered();
-            this.Print($"闸后未死判定 = {(this.stuckTriggerEnabled ? "on" : "off")}（" +
-                       (this.stuckTriggerEnabled
-                           ? "窗口走完仍未击杀 → 判定已触发未死 → 拉黑，只有击杀/脱战才解除"
-                           : "窗口走完不拉黑，仍可自动前往") + "）。");
-            if (arg.Length == 0) this.Print("用法：/水桶 trigger stuck on|off");
-            return;
-        }
-
-        // /水桶 trigger scan —— 按当前数据演练一遍，只打印不写盘
+        // /水桶 trigger scan —— 与看板对账，只打印不写盘
         if (sub == "scan")
         {
             this.PrintTriggerScan();
@@ -664,16 +595,16 @@ public sealed partial class Plugin
             this.SeedKilledWatermarkFromKnownDeaths();
             this.SaveTriggered();
             this.nativeHud?.ForceMainRefresh();
-            this.Print($"已清空「已被触发」黑名单（{n} 条）。清空后这些 S 会重新进入自动前往队列；" +
-                       "现有击杀记录视为已消化，不会再被锁回。");
+            this.Print($"已清空「已被触发」黑名单（{n} 条）。" +
+                       "注意：看板仍显示在场的 S 会在下一轮同步（≤3 分钟）重新标红 —— 以看板为准。");
             return;
         }
 
         this.Print($"— 已被他人触发的 S — 共 {this.triggeredMonsters.Count} 条" +
-                   $"（主站 {MainModeText(this.mainTriggerMode)} · 闸后判定 {(this.stuckTriggerEnabled ? "on" : "off")}）");
+                   $"（看板 {MainModeText(this.mainTriggerMode)} · {this.relayStatus}）");
         if (this.triggeredMonsters.Count == 0)
         {
-            this.Print("当前没有拉黑任何 S。/水桶 trigger scan 可看各段判定结果。");
+            this.Print("当前没有拉黑任何 S。/水桶 trigger scan 可与看板对账。");
             return;
         }
         foreach (var kv in this.triggeredMonsters.OrderByDescending(x => x.Value).Take(12))
@@ -689,54 +620,67 @@ public sealed partial class Plugin
     }
 
     /// <summary>
-    /// 演练：只统计「按当前 lastDeath 落在哪一段」，不写任何数据。
-    /// 用来确认规则没误伤 —— 尤其是闸内段必须是全部放行。
+    /// 与看板对账：按看板口径统计「在场 / 过期 / 已击杀」，并与本地黑名单逐条比对。
+    /// 只打印，不写盘 —— 这是确认「插件显示 == 看板显示」的唯一手段。
     /// </summary>
     private void PrintTriggerScan()
     {
-        if (this.srankData?.dcs is not { Count: > 0 } dcs)
+        this.Print($"— 看板「已触发（当前在场）」对账（{DateTime.Now:HH:mm:ss}，只读）—");
+        this.Print($"  {this.relayStatus}" +
+                   (this.relayGenerated > 0
+                       ? $"，快照生成 {Math.Round((DateTimeOffset.UtcNow.ToUnixTimeSeconds() - this.relayGenerated) / 60.0)} 分钟前"
+                       : ""));
+
+        if (this.relayLive.Count == 0)
         {
-            this.Print("还没有加载 S 数据，待主站同步后再试。");
-            return;
+            this.Print("  还没有拉到看板数据（检查网络 / 站点是否在线）。");
         }
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        int cdLock = 0, openPass = 0, stuckLock = 0, unknown = 0, sonarLocked = 0;
-        var samples = new List<string>();
-
-        foreach (var dc in dcs)
-            foreach (var h in dc.hunts)
-                foreach (var w in h.worlds)
+        else
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            int total = 0, expired = 0, died = 0, live = 0;
+            foreach (var worldKv in this.relayLive)
+                foreach (var huntKv in worldKv.Value)
                 {
-                    var key = TrigKey(h.en, w.world);
-                    var locked = this.triggeredMonsters.ContainsKey(key);
-                    this.triggeredSource.TryGetValue(key, out var src);
-                    if (locked && string.Equals(src, SourceSonar, StringComparison.Ordinal)) { sonarLocked++; continue; }
-
-                    var ld = w.lastDeath;
-                    if (ld <= 0) { unknown++; continue; }
-                    var (cd, win) = this.WindowOf(h, ld);
-                    if (cd <= 0) { unknown++; continue; }
-                    switch (Calc(ld, now, cd, win).State)
-                    {
-                        case "cd": cdLock++; break;
-                        case "open":
-                            openPass++;
-                            if (samples.Count < 5)
-                                samples.Add($"{w.world}·{h.cn} 闸内（放行）");
-                            break;
-                        default:
-                            stuckLock++;
-                            samples.Add($"{w.world}·{h.cn} 闸已过 {(now - (ld + cd * 3600 + win * 3600)) / 3600.0:F1}h 仍无击杀 → 锁");
-                            break;
-                    }
+                    var row = huntKv.Value;
+                    if (row is null || row.Length < 1 || row[0] <= 0) continue;
+                    total++;
+                    if (now - row[0] > RelayMaxAgeSeconds) { expired++; continue; }
+                    if (this.DeathOf(huntKv.Key, worldKv.Key) >= row[0] - RelayKillTolerance) { died++; continue; }
+                    live++;
                 }
+            this.Print($"  relay 共 {total} 条 → 超 20h 过期 {expired} · 之后已击杀 {died} ⇒ 看板在场 {live} 只");
+        }
 
-        this.Print($"— 黑名单演练（{DateTime.Now:HH:mm:ss}，只统计不写盘）—");
-        this.Print($"  冷却段（有未消化记录→锁）：{cdLock} 只");
-        this.Print($"  闸内段（→放行，可以去）：{openPass} 只");
-        this.Print($"  闸后段（→判定已触发未死，锁）：{stuckLock} 只");
-        this.Print($"  无击杀记录（无法定位窗口，跳过）：{unknown} 只");
-        this.Print($"  Sonar 出生锁（只认击杀/脱战）：{sonarLocked} 只");
-        foreach (var s in samples.Take(6)) this.Print("   · " + s);
+        var bySrc = this.triggeredMonsters.Keys
+            .GroupBy(k => SourceText(this.triggeredSource.TryGetValue(k, out var s) ? s : null))
+            .ToDictionary(g => g.Key, g => g.Count());
+        this.Print($"  本地黑名单 {this.triggeredMonsters.Count} 只" +
+                   (bySrc.Count > 0
+                       ? "（" + string.Join(" · ", bySrc.Select(kv => kv.Key + " " + kv.Value)) + "）"
+                       : ""));
+
+        // 逐条对账：看板在场却没锁 / 看板不在场却锁着（且非 Sonar）
+        var expect = new HashSet<string>(StringComparer.Ordinal);
+        var now2 = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        foreach (var worldKv in this.relayLive)
+            foreach (var huntKv in worldKv.Value)
+            {
+                var row = huntKv.Value;
+                if (row is null || row.Length < 1 || row[0] <= 0) continue;
+                if (now2 - row[0] > RelayMaxAgeSeconds) continue;
+                if (this.DeathOf(huntKv.Key, worldKv.Key) >= row[0] - RelayKillTolerance) continue;
+                expect.Add(TrigKey(huntKv.Key, worldKv.Key));
+            }
+
+        var missing = expect.Where(k => !this.triggeredMonsters.ContainsKey(k)).ToList();
+        var extra = this.triggeredMonsters.Keys
+            .Where(k => !expect.Contains(k) &&
+                        IsMainSide(this.triggeredSource.TryGetValue(k, out var s) ? s : null))
+            .ToList();
+        this.Print($"  对账：看板在场但未锁 {missing.Count} 只 · 看板不在场却锁着 {extra.Count} 只" +
+                   (missing.Count == 0 && extra.Count == 0 ? "（完全一致）" : ""));
+        foreach (var k in missing.Take(3)) this.Print("   · 待锁 " + k);
+        foreach (var k in extra.Take(3)) this.Print("   · 待放 " + k);
     }
 }
