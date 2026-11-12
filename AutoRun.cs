@@ -169,8 +169,10 @@ public sealed partial class Plugin
         this.autoToken++;
         this.autoPaused = false;
         this.autoPauseReason = "";
-        this.autoHudOpen = true;    // 开跑就把「正在触发什么」的小窗亮出来
-        this.CaptureWindowStateBeforeTeleport();   // v1.2.9：快照要包含刚打开的触发悬浮窗
+        // v1.2.11：点「开始自动前往」绝不改动任何窗口开关 —— 原来开着几个窗就保持几个，
+        // 原来关着的也不强行点亮。想看触发进度请先手动 /水桶 hud 打开触发悬浮窗。
+        // 下面这张快照记的是用户原本的窗口状态，整个触发过程落地后都按它恢复。
+        this.CaptureWindowStateBeforeTeleport();
         if (wasRunning) { try { this.StopAll(true); } catch { } }   // 顺手把上一轮的寻路/传送也取消掉
         if (this.srankData?.data is not { } data)
         {
@@ -1025,7 +1027,7 @@ public sealed partial class Plugin
             else if (this.autoRunning) this.AutoStop();
             else this.AutoStart();
         },
-        // v1.2.8 强锁：最顶层拦截，自动化会话中绝不把自动前往窗开关写死为 false。
+        // v1.2.11：过图 hide addon 时如实回写即可；窗口由传送快照在落地后按原状态恢复。
         Closed = () => this.autoRunOpen = false,
     };
 
