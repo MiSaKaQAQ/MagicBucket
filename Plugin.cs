@@ -272,10 +272,14 @@ public sealed partial class Plugin : IDalamudPlugin
     private bool settingsWindowOpen;
     // ───────── v1.2.9：过图窗口快照（传送前记录 / 落地后延迟恢复，绝不强锁） ─────────
     private bool teleportSnapshotPending;
-    private bool teleportSnapshotMain, teleportSnapshotHud, teleportSnapshotAuto;
+    private bool teleportSnapshotMain, teleportSnapshotHud, teleportSnapshotAuto, teleportSnapshotSettings;
     private DateTime teleportSnapshotAtUtc = DateTime.MinValue;
     private DateTime restoreAfterTeleportUtc = DateTime.MinValue;
     private bool wasBetweenAreas;
+    // v1.2.11：稳定态窗口寄存器。每帧在「非过图 + 已落地」时记录用户当前可见的 4 个窗口开关，
+    // 作为传送快照的权威来源。游戏过图 hide addon 会把 bool 写成 false，直接拍快照会被污染。
+    private bool stableWindowMain, stableWindowHud, stableWindowAuto, stableWindowSettings;
+    private bool stableWindowValid;
     /// <summary>「停止」令牌：每次点停止 +1，之前排进队列的延时任务全部作废。</summary>
     private int runGen;
     /// <summary>硬停止开关：停止后连「已经排到框架线程上、还没来得及发」的命令也一并拦掉。
@@ -433,10 +437,9 @@ public sealed partial class Plugin : IDalamudPlugin
             // 不调用任何 ImGui API，也不依赖 Draw 帧或 Tick 的 200ms 节流。
             // 切完立即直接驱动原生 KTK 窗口（Close→Open 绕过 IsOpen 缓存），敲一下必定当帧生效。
             // 用户主动敲命令优先于传送快照，避免落地恢复把刚关掉的窗口又打开。
-            this.teleportSnapshotPending = false;
-            this.restoreAfterTeleportUtc = DateTime.MinValue;
             this.mainWindowOpen = !this.mainWindowOpen;
             this.ApplyMainWindowNow();
+            this.NoteUserWindowChange();   // v1.2.11：用户意图同步进快照，落地按最新状态恢复
             this.Print(this.mainWindowOpen ? "主窗已打开" : "主窗已关闭（再敲 /水桶 可开回来）");
             return;
         }
@@ -546,15 +549,15 @@ public sealed partial class Plugin : IDalamudPlugin
                 this.StopAll();
                 return;
             case "ui":
-                this.teleportSnapshotPending = false;
                 this.mainWindowOpen = !this.mainWindowOpen;
                 this.ApplyMainWindowNow();
+                this.NoteUserWindowChange();
                 return;
             case "legacy":
                 // v1.2.6 起旧 ImGui 完整版已封死，这个别名只负责把原生主窗拉回来。
-                this.teleportSnapshotPending = false;
                 this.mainWindowOpen = true;
                 this.ApplyMainWindowNow();
+                this.NoteUserWindowChange();
                 this.Print("旧 ImGui 完整版已移除；已打开原生主窗。");
                 return;
             case "mount":
@@ -3611,12 +3614,57 @@ public sealed partial class Plugin : IDalamudPlugin
     /// 不强锁、不拦截 OnHide 回写；落地后按这份快照恢复。</summary>
     private void CaptureWindowStateBeforeTeleport()
     {
-        this.teleportSnapshotMain = this.mainWindowOpen;
-        this.teleportSnapshotHud = this.autoHudOpen;
-        this.teleportSnapshotAuto = this.autoRunOpen;
+        // v1.2.11：已有快照时只刷新时间戳，绝不覆盖 bool。
+        // 自动前往队列会连续多次 Goto，且过图时游戏 hide addon 已经把开关写成 false；
+        // 这时候重拍会把「全关」当成用户原本的状态，落地后窗口就再也恢复不回来。
+        if (this.teleportSnapshotPending)
+        {
+            this.teleportSnapshotAtUtc = DateTime.UtcNow;
+            return;
+        }
+
+        // 优先采用稳定态寄存器：它记录的是过图前最后一帧用户真正看到的窗口。
+        // 当前仍在稳定态就用当前 bool 刷新一次（用户刚切换窗口也能立即生效）。
+        if (!this.stableWindowValid) this.RecordStableWindowState();
+        bool betweenNow = false;
+        try { betweenNow = this.condition[ConditionFlag.BetweenAreas]; } catch { }
+        if (!betweenNow) this.RecordStableWindowState();
+
+        this.teleportSnapshotMain = this.stableWindowMain;
+        this.teleportSnapshotHud = this.stableWindowHud;
+        this.teleportSnapshotAuto = this.stableWindowAuto;
+        this.teleportSnapshotSettings = this.stableWindowSettings;
         this.teleportSnapshotPending = true;
         this.teleportSnapshotAtUtc = DateTime.UtcNow;
         this.restoreAfterTeleportUtc = DateTime.MinValue;
+    }
+
+    /// <summary>把用户当前可见的 4 个窗口开关记进稳定态寄存器。</summary>
+    private void RecordStableWindowState()
+    {
+        this.stableWindowMain = this.mainWindowOpen;
+        this.stableWindowHud = this.autoHudOpen;
+        this.stableWindowAuto = this.autoRunOpen;
+        this.stableWindowSettings = this.settingsWindowOpen;
+        this.stableWindowValid = true;
+    }
+
+    /// <summary>传送尚未落地时，用户手动开 / 关窗口也要同步进快照。</summary>
+    private void SyncSnapshotFromStable()
+    {
+        if (!this.teleportSnapshotPending) return;
+        this.teleportSnapshotMain = this.stableWindowMain;
+        this.teleportSnapshotHud = this.stableWindowHud;
+        this.teleportSnapshotAuto = this.stableWindowAuto;
+        this.teleportSnapshotSettings = this.stableWindowSettings;
+    }
+
+    /// <summary>用户主动开 / 关窗口：立刻把新意图记进寄存器与待恢复快照。
+    /// v1.2.9 这里清 pending，会让落地后其它窗口丢失；现在只更新快照值。</summary>
+    private void NoteUserWindowChange()
+    {
+        this.RecordStableWindowState();
+        this.SyncSnapshotFromStable();
     }
 
     /// <summary>每帧检测「过图 → 落地」。真正站稳（已登录 + LocalPlayer 存在）后
@@ -3628,14 +3676,29 @@ public sealed partial class Plugin : IDalamudPlugin
         try { between = this.condition[ConditionFlag.BetweenAreas]; }
         catch { return; }
 
+        bool landed;
+        try { landed = this.clientState.IsLoggedIn && this.objectTable.LocalPlayer is not null; }
+        catch { return; }
+
         if (between)
         {
-            // 玩家手动传送（没走插件的 Goto）也要补拍快照。
+            // 玩家手动传送（没走插件的 Goto）也要补拍快照（此时快照取自稳定态寄存器）。
             if (!this.teleportSnapshotPending) this.CaptureWindowStateBeforeTeleport();
             this.teleportSnapshotAtUtc = DateTime.UtcNow;   // 过图中不计时，防止长时间排队被误判超时
             this.wasBetweenAreas = true;
             this.restoreAfterTeleportUtc = DateTime.MinValue;
             return;
+        }
+
+        // v1.2.11：稳定态每帧记录用户当前可见的 4 个窗口开关。
+        // 传送还没进入落地倒计时时，用户手动开 / 关窗口也同步进快照，
+        // 否则落地恢复会用旧值盖掉用户的新意图。一旦开始倒计时就冻结快照，
+        // 避免落地瞬间 hide addon 的 false 回写污染它。
+        if (landed)
+        {
+            this.RecordStableWindowState();
+            if (this.teleportSnapshotPending && this.restoreAfterTeleportUtc == DateTime.MinValue)
+                this.SyncSnapshotFromStable();
         }
 
         var sawBetweenAreas = this.wasBetweenAreas;
@@ -3647,10 +3710,6 @@ public sealed partial class Plugin : IDalamudPlugin
             this.restoreAfterTeleportUtc = DateTime.MinValue;
             return;
         }
-
-        bool landed;
-        try { landed = this.clientState.IsLoggedIn && this.objectTable.LocalPlayer is not null; }
-        catch { return; }
         if (!landed) return;
 
         if (this.restoreAfterTeleportUtc == DateTime.MinValue)
@@ -3665,15 +3724,19 @@ public sealed partial class Plugin : IDalamudPlugin
         this.restoreAfterTeleportUtc = DateTime.MinValue;
         this.teleportSnapshotPending = false;
 
-        // ① 先把开关写回快照值，让 Tick* 的 wantOpen 与命令的 toggle 保持一致；
+        // ① 先把 4 个开关写回快照值，让 Tick* 的 wantOpen 与命令的 toggle 保持一致；
         this.mainWindowOpen = this.teleportSnapshotMain;
         this.autoHudOpen = this.teleportSnapshotHud;
         this.autoRunOpen = this.teleportSnapshotAuto;
+        this.settingsWindowOpen = this.teleportSnapshotSettings;
+        this.RecordStableWindowState();
         // ② 再直接驱动原生 KTK：Close→Open 绕过 IsOpen 缓存；底层报错由 Runtime 捕获并释放重开。
+        // 只复活快照里原本开着的窗口，原本关着的绝不点亮。
         try
         {
             this.nativeHud?.RestoreAfterTeleport(this.teleportSnapshotMain,
-                this.teleportSnapshotHud, this.teleportSnapshotAuto);
+                this.teleportSnapshotHud, this.teleportSnapshotAuto,
+                this.teleportSnapshotSettings);
         }
         catch (Exception ex)
         {
