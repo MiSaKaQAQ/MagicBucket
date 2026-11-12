@@ -42,6 +42,21 @@ public sealed partial class Plugin
     /// <summary>这只怪的地图是否在自动前往范围内。</summary>
     private static bool AutoMapOk(HuntData x) => AutoMaps.Contains(x.map);
 
+    // ───────────── 维护感知状态（与 UI 进闸判定完全对齐） ─────────────
+
+    /// <summary>与主界面 BuildMainSnapshot 完全一致的「维护感知」状态计算：
+    /// 开闸 = max(lastDeath, restartAt) + cd；当全局重启时间 T 主导（restartAt &gt; lastDeath）时，
+    /// 改用维护再生 mt[0]/mt[1] 覆盖 cd/win。这样主界面判为「进闸」的，自动前往也一定能纳入队列。</summary>
+    private (string State, double Eta, double Pct) CalcState(HuntData h, double lastDeath, long now)
+    {
+        if (lastDeath <= 0) return ("unknown", 0, 0);
+        var eff = Math.Max(lastDeath, this.restartAt);
+        var maint = this.restartAt > 0 && this.restartAt > lastDeath;
+        var useCd = maint && h.mt.Length >= 1 ? h.mt[0] : h.cd;
+        var useWin = maint && h.mt.Length >= 2 ? h.mt[1] : h.win;
+        return Calc(eff, now, useCd, useWin);
+    }
+
     // ───────────── 队列状态 ─────────────
     private sealed record AutoJob(string World, string HuntCn, string HuntEn, string Map);
 
@@ -297,7 +312,7 @@ public sealed partial class Plugin
         foreach (var w in h.worlds)
         {
             if (!string.Equals(w.world, world, StringComparison.Ordinal) || w.lastDeath <= 0) continue;
-            return Calc(w.lastDeath, now, h.cd, h.win).State == "open";
+            return CalcState(h, w.lastDeath, now).State == "open";
         }
         return false;
     }
@@ -309,7 +324,7 @@ public sealed partial class Plugin
         foreach (var w in h.worlds)
         {
             if (w.lastDeath <= 0) continue;
-            if (Calc(w.lastDeath, now, h.cd, h.win).State == "open") list.Add(w.world);
+            if (CalcState(h, w.lastDeath, now).State == "open") list.Add(w.world);
         }
         return list;
     }
@@ -1033,9 +1048,7 @@ public sealed partial class Plugin
                 : string.Join("、", this.autoHits.Skip(Math.Max(0, this.autoHits.Count - 3)).Select(h => h.cn));
         }
 
-        var worlds = data is not null
-            ? data.worlds.Where(w => w.Length > 0).ToList()
-            : new List<string>();
+        var worlds = data is not null ? data.worlds.Where(w => w.Length > 0).ToList() : new List<string>();
         s.WorldCaption = this.autoAllWorlds
             ? $"共 {worlds.Count} 服 · 每只 S 只去进闸的服（只看开闸：{(this.autoOnlyOpen ? "开" : "关")}）"
             : $"服务器（已选 {this.autoWorlds.Count}/{worlds.Count}）· 点服名勾选";
@@ -1064,10 +1077,11 @@ public sealed partial class Plugin
         if (data is not null)
         {
             var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var mh = data.hunts;
             var states = new Dictionary<string, (string state, double eta, double pct)>(StringComparer.Ordinal);
-            foreach (var hd in data.hunts) states[hd.cn] = this.BestStateOf(hd, now);
+            foreach (var hd in mh) states[hd.cn] = this.BestStateOf(hd, now);
 
-            var shown = data.hunts.Where(x => this.AutoShown(x, states));
+            var shown = mh.Where(x => this.AutoShown(x, states));
             var list = (this.autoStyle == 1
                     ? shown.OrderBy(x => x.patch).ThenBy(x => x.cn, StringComparer.Ordinal)
                     : shown.OrderBy(x => x.cn, StringComparer.Ordinal))
@@ -1354,7 +1368,7 @@ public sealed partial class Plugin
         ImGui.Separator();
 
         // 服务器选择（两种样式共用顶部 chips）
-        var worlds = data.worlds.Where(w => w.Length > 0).ToList();
+        var worlds = data is not null ? data.worlds.Where(w => w.Length > 0).ToList() : new List<string>();
         this.AutoText(this.autoAllWorlds ? "服务器" : $"服务器（已选 {this.autoWorlds.Count}/{worlds.Count}）", 12.5f, V1Dim);
         ImGui.SameLine(0, 8);
 
@@ -1558,8 +1572,8 @@ public sealed partial class Plugin
     // ── 样式 1：按版本分组、可折叠 ──
     private void AutoBodyGrouped(float h, Dictionary<string, (string state, double eta, double pct)> states)
     {
-        var data = this.srankData!.data!;
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var mh = this.srankData?.data?.hunts ?? System.Array.Empty<HuntData>();
         var groups = new (string key, string label)[]
         {
             ("DT", "7.x 金曦之遗辉"), ("EW", "6.x 晓月之终途"), ("ShB", "5.x 暗影之逆焰"),
@@ -1570,7 +1584,7 @@ public sealed partial class Plugin
         var any = false;
         foreach (var (key, label) in groups)
         {
-            var list = data.hunts
+            var list = mh
                 .Where(x => x.patch == key && this.AutoShown(x, states))
                 .OrderBy(x => x.cn, StringComparer.Ordinal)
                 .ToList();
@@ -1619,9 +1633,8 @@ public sealed partial class Plugin
     // ── 样式 2：极简卡片（只有名字 + 状态色条，详情走悬浮提示） ──
     private void AutoBodyCards(float h, Dictionary<string, (string state, double eta, double pct)> states)
     {
-        var data = this.srankData!.data!;
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var hunts = data.hunts
+        var hunts = (this.srankData?.data?.hunts ?? System.Array.Empty<HuntData>())
             .Where(x => this.AutoShown(x, states))
             .OrderBy(x => x.patch)
             .ThenBy(x => x.cn, StringComparer.Ordinal)
@@ -1764,7 +1777,7 @@ public sealed partial class Plugin
         {
             if (w.lastDeath <= 0) continue;
             if (!this.autoAllWorlds && this.autoWorlds.Count > 0 && !this.autoWorlds.Contains(w.world)) continue;
-            var c = Calc(w.lastDeath, now, h.cd, h.win);
+            var c = CalcState(h, w.lastDeath, now);
             var r = c.State switch { "open" => 0, "cd" => 1, "over" => 2, _ => 3 };
             if (r < rank) { rank = r; best = (c.State, c.Eta, c.Pct); }
         }
