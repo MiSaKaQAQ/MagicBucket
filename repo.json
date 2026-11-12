@@ -2,12 +2,12 @@
   {
     "Name": "魔法水桶",
     "InternalName": "SrankFlag",
-    "AssemblyVersion": "1.2.12.0",
-    "Description": "四大区 S 怪开闸/窗口实时监控，按服筛选、绿点点位、2.0~7.0 版本过滤；点一下自动跨服传送、开图插旗、按最近邻走完所有绿点。附带触发要点与触发准备（切职业套装 / 召唤宠物 / 丢弃物品）。v1.2.12 新增：Sonar 聊天栏实时击杀监听、S 怪历史记录窗口、已被他人触发的 S 自动拉黑并跳过。",
+    "AssemblyVersion": "1.2.13.0",
+    "Description": "四大区 S 怪开闸/窗口实时监控，按服筛选、绿点点位、2.0~7.0 版本过滤；点一下自动跨服传送、开图插旗、按最近邻走完所有绿点。附带触发要点与触发准备（切职业套装 / 召唤宠物 / 丢弃物品）。v1.2.13 修正：「已被他人触发」改为直接对齐站点看板（bot_relay.json）的「已触发（当前在场）」，不再自行推算窗口；另有 Sonar 聊天栏实时击杀监听与 S 怪历史记录窗口。",
     "RepoUrl": "https://github.com/MiSaKaQAQ/MagicBucket",
-    "DownloadLinkInstall": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.12/SrankFlag.zip",
-    "DownloadLinkUpdate": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.12/SrankFlag.zip",
-    "DownloadLinkTesting": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.12/SrankFlag.zip",
+    "DownloadLinkInstall": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.13/SrankFlag.zip",
+    "DownloadLinkUpdate": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.13/SrankFlag.zip",
+    "DownloadLinkTesting": "https://github.com/MiSaKaQAQ/MagicBucket/releases/download/v1.2.13/SrankFlag.zip",
     "ApplicableVersion": "any",
     "Tags": [
       "srank",
@@ -16,6 +16,6 @@
     ],
     "DalamudApiLevel": 15,
     "Punchline": "S 怪速查：可触发监控 + 一键开图插旗寻路。",
-    "Changelog": "v1.2.12：① 接入 Sonar 聊天栏实时击杀播报（三条互斥严格正则，只增不减，出生播报不影响概率）；② 新增 S 怪历史记录窗口（时间/怪名/服务器/事件/来源，主站+Sonar 双源，最多 500 条）；③ 「已被他人触发」改按窗口三段判定：冷却段有记录→锁，闸内→放行，闸走完仍无击杀→判定已触发未死并锁，只有击杀或 Sonar 脱战/重置才解除；主窗红标 [已触发]、按钮置灰 [已被抢触]、自动前往三重跳过。新增 /水桶 trigger scan 演练。升级后请 /xlplugins 重载。"
+    "Changelog": "v1.2.13（修正 v1.2.12 的「全部显示已触发」）：① 「已被他人触发」不再用 lastDeath + cd/win 反推进闸/闸后，改为直接读站点看板 http://119.29.119.179/srank/bot_relay.json，判定口径与看板 index.html 逐条一致：relay 有该怪 + 未超 20 小时 + 之后没有更新的击杀（30 秒容差）= 已触发（当前在场），否则放行；② 看板撤下该怪时插件立即解除红标、恢复 [执行触发]/[自动前往]、自动前往重新可选；③ Sonar 出生播报仍然独立拉黑（更快），只认击杀 / 脱战重置；④ /水桶 trigger scan 改为与看板对账（relay 条数 / 过期 / 已击杀 / 在场 / 本地锁 / 差几条）；⑤ 旧版本留下的错误锁会在升级后第一轮同步自动放掉，无需手动 clear。实测：relay 20 服 320 条 → 看板在场 222 只（不是全表）。升级后请 /xlplugins 重载。"
   }
 ]
