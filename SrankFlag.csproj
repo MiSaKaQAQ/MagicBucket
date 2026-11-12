@@ -2,9 +2,9 @@
   <PropertyGroup>
     <AssemblyName>SrankFlag</AssemblyName>
     <RootNamespace>SrankFlag</RootNamespace>
-  <Version>1.2.3.0</Version>
-  <AssemblyVersion>1.2.3.0</AssemblyVersion>
-  <FileVersion>1.2.3.0</FileVersion>
+  <Version>1.2.4.0</Version>
+  <AssemblyVersion>1.2.4.0</AssemblyVersion>
+  <FileVersion>1.2.4.0</FileVersion>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
 
     <!-- 清单 -->
@@ -19,7 +19,7 @@
 
   <PropertyGroup>
     <!-- 钉死到游戏实际注入的 Dalamud 版本（XIVLauncherCN 的 15.x），避免浮动引用导致运行时 MissingMethodException -->
-    <DalamudLibPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\addon\Hooks\26-11-06-02\</DalamudLibPath>
+    <DalamudLibPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\addon\Hooks\26-11-10-01\</DalamudLibPath>
     <!-- 关键：Dalamud SDK 在 Sdk.props 里已把默认路径（%APPDATA%\XIVLauncher\...\Hooks\dev，旧版 13.x）固化进
          AssemblySearchPaths，只改 DalamudLibPath 无效。这里把它前置，保证引用解析到上面这个目录。 -->
     <AssemblySearchPaths>$(DalamudLibPath);$(AssemblySearchPaths)</AssemblySearchPaths>
@@ -34,11 +34,11 @@
        这两个 DLL 会随编译复制到 bin/Release，部署时也要一起放进插件目录。 -->
   <ItemGroup>
     <Reference Include="KamiToolKit">
-      <HintPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\installedPlugins\DailyRoutines\2.2.7.1\KamiToolKit.dll</HintPath>
+      <HintPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\installedPlugins\DailyRoutines\2.2.8.0\KamiToolKit.dll</HintPath>
       <Private>true</Private>
     </Reference>
     <Reference Include="FFXIVClientStructs.Expansion">
-      <HintPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\installedPlugins\DailyRoutines\2.2.7.1\FFXIVClientStructs.Expansion.dll</HintPath>
+      <HintPath>C:\Users\QQ221\AppData\Roaming\XIVLauncherCN\installedPlugins\DailyRoutines\2.2.8.0\FFXIVClientStructs.Expansion.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>
